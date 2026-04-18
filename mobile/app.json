@@ -9,7 +9,12 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.arawal.mobile",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Allow phia to access your most recent photo to extract clothing insights and personalize your shopping experience.",
+        "NSPhotoLibraryAddUsageDescription": "Allow phia to save synced photo previews to your library if you choose to export them."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -27,6 +32,12 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow this app to read your photos so it can build your closet."
+        }
+      ],
       [
         "expo-splash-screen",
         {

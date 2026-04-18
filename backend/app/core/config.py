@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -21,7 +24,30 @@ class Settings(BaseSettings):
 
     cors_origins: list[str] = ["*"]
 
+    data_dir: Path = Path("./data")
+    sqlite_path: Path = Path("./data/phia.db")
+    media_dir: Path = Path("./data/media")
+    public_media_base_url: str = ""
+
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5.4"
+
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+
+    serpapi_key: str = ""
+    replicate_api_token: str = ""
+
+    recent_limit: int = 50
+    photo_concurrency: int = 10
+    lookup_concurrency: int = 5
+
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    return settings
