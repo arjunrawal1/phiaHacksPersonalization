@@ -109,6 +109,7 @@ def init_db(db_path: Path) -> None:
                 tier TEXT NOT NULL DEFAULT 'generic',
                 exact_matches TEXT NOT NULL DEFAULT '[]',
                 similar_products TEXT NOT NULL DEFAULT '[]',
+                phia_products TEXT NOT NULL DEFAULT '[]',
                 best_match TEXT,
                 best_match_confidence REAL,
                 created_at TEXT NOT NULL,
@@ -126,6 +127,15 @@ def init_db(db_path: Path) -> None:
             );
             """
         )
+
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(clothing_items)").fetchall()
+        }
+        if "phia_products" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE clothing_items ADD COLUMN phia_products TEXT NOT NULL DEFAULT '[]'"
+            )
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -441,6 +451,7 @@ def insert_clothing_item(
     tier: str,
     exact_matches: list[dict[str, Any]],
     similar_products: list[dict[str, Any]],
+    phia_products: list[dict[str, Any]],
     best_match: dict[str, Any] | None,
     best_match_confidence: float,
 ) -> str:
@@ -452,8 +463,8 @@ def insert_clothing_item(
             INSERT INTO clothing_items (
                 id, job_id, photo_id, category, description, colors, pattern, style,
                 brand_visible, visibility, confidence, bounding_box, crop_path, tier,
-                exact_matches, similar_products, best_match, best_match_confidence, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                exact_matches, similar_products, phia_products, best_match, best_match_confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
@@ -472,6 +483,7 @@ def insert_clothing_item(
                 tier,
                 json.dumps(exact_matches),
                 json.dumps(similar_products),
+                json.dumps(phia_products),
                 json.dumps(best_match) if best_match else None,
                 best_match_confidence,
                 now,
@@ -486,6 +498,7 @@ def update_clothing_item(
     tier: str,
     exact_matches: list[dict[str, Any]],
     similar_products: list[dict[str, Any]],
+    phia_products: list[dict[str, Any]],
     best_match: dict[str, Any] | None,
     best_match_confidence: float,
     crop_path: str | None,
@@ -494,7 +507,7 @@ def update_clothing_item(
         conn.execute(
             """
             UPDATE clothing_items
-            SET tier = ?, exact_matches = ?, similar_products = ?, best_match = ?,
+            SET tier = ?, exact_matches = ?, similar_products = ?, phia_products = ?, best_match = ?,
                 best_match_confidence = ?, crop_path = ?
             WHERE id = ?
             """,
@@ -502,6 +515,7 @@ def update_clothing_item(
                 tier,
                 json.dumps(exact_matches),
                 json.dumps(similar_products),
+                json.dumps(phia_products),
                 json.dumps(best_match) if best_match else None,
                 best_match_confidence,
                 crop_path,
@@ -521,6 +535,7 @@ def get_clothing_item(item_id: str) -> dict[str, Any] | None:
     parsed["bounding_box"] = _json_or_default(parsed.get("bounding_box"), {})
     parsed["exact_matches"] = _json_or_default(parsed.get("exact_matches"), [])
     parsed["similar_products"] = _json_or_default(parsed.get("similar_products"), [])
+    parsed["phia_products"] = _json_or_default(parsed.get("phia_products"), [])
     parsed["best_match"] = _json_or_default(parsed.get("best_match"), None)
     return parsed
 
@@ -539,6 +554,7 @@ def list_clothing_items(job_id: str) -> list[dict[str, Any]]:
         parsed["bounding_box"] = _json_or_default(parsed.get("bounding_box"), {})
         parsed["exact_matches"] = _json_or_default(parsed.get("exact_matches"), [])
         parsed["similar_products"] = _json_or_default(parsed.get("similar_products"), [])
+        parsed["phia_products"] = _json_or_default(parsed.get("phia_products"), [])
         parsed["best_match"] = _json_or_default(parsed.get("best_match"), None)
         out.append(parsed)
     return out

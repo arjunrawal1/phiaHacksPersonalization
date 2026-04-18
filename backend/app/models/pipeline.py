@@ -92,6 +92,7 @@ class ClothingItemOut(BaseModel):
     tier: str = "generic"
     exact_matches: list[dict] = Field(default_factory=list)
     similar_products: list[dict] = Field(default_factory=list)
+    phia_products: list[dict] = Field(default_factory=list)
     best_match: BestMatch | None = None
     best_match_confidence: float = 0
 

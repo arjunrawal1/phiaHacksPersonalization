@@ -18,6 +18,57 @@ type PipelineEvent = {
   data?: Record<string, unknown>;
 };
 
+type StepBox = {
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+};
+
+type ClothingStepItem = {
+  category?: string;
+  confidence?: number;
+  visibility?: string;
+  description?: string;
+  bounding_box?: StepBox;
+};
+
+type YoloDebugInfo = {
+  status?: string;
+  prediction_status?: string;
+  error?: string;
+  model_version?: string;
+  detection_count?: number;
+  poll_count?: number;
+  poll_error_http_status?: number;
+  start_attempts?: Array<{
+    wait_seconds?: number;
+    http_status?: number;
+  }>;
+};
+
+type ClothingExtractionStep = {
+  photo_id: string;
+  reason?: string;
+  postprocess_source?: string;
+  yolo_requested_source?: string;
+  yolo_requested_classes?: string[];
+  gpt_identified_classes?: string[];
+  yolo_world_detections?: Array<{
+    label?: string;
+    confidence?: number;
+    bbox?: number[];
+  }>;
+  gpt_cleaned_items?: ClothingStepItem[];
+  visible_items?: ClothingStepItem[];
+  inserted_item_count?: number;
+  yolo_debug?: YoloDebugInfo;
+};
+
 type JobDebug = {
   stages?: Record<string, string>;
   upload?: {
@@ -78,6 +129,7 @@ type JobDebug = {
     finished_at?: string;
     item_count?: number;
     photo_count?: number;
+    per_photo_steps?: ClothingExtractionStep[];
   };
   events?: PipelineEvent[];
 };
@@ -144,6 +196,7 @@ type Props = {
 };
 
 const POLL_MS = 1200;
+type PhotoBreakdownViewMode = "original" | "vlm" | "final";
 
 function isSerpProxyUrl(raw: string): boolean {
   try {
@@ -207,7 +260,7 @@ function getFaceCropStyle(
 }
 
 function getItemBoxStyle(
-  bb: ClothingItem["bounding_box"] | null | undefined
+  bb: StepBox | null | undefined
 ): React.CSSProperties {
   const x = Math.max(0, Math.min(1, Number(bb?.x ?? bb?.left ?? 0)));
   const y = Math.max(0, Math.min(1, Number(bb?.y ?? bb?.top ?? 0)));
@@ -223,6 +276,50 @@ function getItemBoxStyle(
   };
 }
 
+function getYoloBoxStyle(
+  bbox: number[] | null | undefined,
+  imageWidth: number | null | undefined,
+  imageHeight: number | null | undefined
+): React.CSSProperties {
+  if (!bbox || bbox.length < 4) {
+    return { display: "none" };
+  }
+
+  const rawX1 = Number(bbox[0] ?? 0);
+  const rawY1 = Number(bbox[1] ?? 0);
+  const rawX2 = Number(bbox[2] ?? 0);
+  const rawY2 = Number(bbox[3] ?? 0);
+  const safeW = Number(imageWidth ?? 0);
+  const safeH = Number(imageHeight ?? 0);
+
+  let x1 = rawX1;
+  let y1 = rawY1;
+  let x2 = rawX2;
+  let y2 = rawY2;
+
+  if (safeW > 0 && safeH > 0) {
+    x1 /= safeW;
+    x2 /= safeW;
+    y1 /= safeH;
+    y2 /= safeH;
+  }
+
+  x1 = Math.max(0, Math.min(1, x1));
+  y1 = Math.max(0, Math.min(1, y1));
+  x2 = Math.max(0, Math.min(1, x2));
+  y2 = Math.max(0, Math.min(1, y2));
+
+  const width = Math.max(0, x2 - x1);
+  const height = Math.max(0, y2 - y1);
+
+  return {
+    left: `${x1 * 100}%`,
+    top: `${y1 * 100}%`,
+    width: `${width * 100}%`,
+    height: `${height * 100}%`,
+  };
+}
+
 export function PipelineDashboard({ backendUrl }: Props) {
   const [jobs, setJobs] = useState<JobSummary[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
@@ -230,6 +327,14 @@ export function PipelineDashboard({ backendUrl }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busySelectClusterId, setBusySelectClusterId] = useState<string | null>(null);
   const [visibleSerpUrls, setVisibleSerpUrls] = useState<string[]>([]);
+  const [carouselState, setCarouselState] = useState<{ key: string; index: number }>({
+    key: "",
+    index: 0,
+  });
+  const [photoViewState, setPhotoViewState] = useState<{ key: string; mode: PhotoBreakdownViewMode }>({
+    key: "",
+    mode: "final",
+  });
 
   const load = useCallback(async () => {
     try {
@@ -340,6 +445,38 @@ export function PipelineDashboard({ backendUrl }: Props) {
         items: itemsByPhoto.get(photo.id) ?? [],
       }));
   }, [detail, selectedClusterPhotoIds, itemsByPhoto]);
+  const closetProducts = useMemo(() => {
+    return chosenFacePhotoRows
+      .flatMap(({ items }) => items)
+      .map((item) => ({ item, match: item.best_match }))
+      .filter((entry) => !!entry.match?.link);
+  }, [chosenFacePhotoRows]);
+
+  const clothingStepByPhoto = useMemo(() => {
+    const map = new Map<string, ClothingExtractionStep>();
+    const steps = detail?.debug?.clothing_extraction?.per_photo_steps ?? [];
+    for (const step of steps) {
+      if (step?.photo_id) {
+        map.set(step.photo_id, step);
+      }
+    }
+    return map;
+  }, [detail?.debug?.clothing_extraction?.per_photo_steps]);
+
+  const carouselKey = `${detail?.id ?? ""}:${selectedCluster?.id ?? ""}`;
+  const carouselMaxIndex = Math.max(0, chosenFacePhotoRows.length - 1);
+  const chosenFacePhotoIndex =
+    carouselState.key === carouselKey ? Math.min(carouselState.index, carouselMaxIndex) : 0;
+  const activeChosenFaceRow = chosenFacePhotoRows[chosenFacePhotoIndex] ?? null;
+  const activePhotoViewMode: PhotoBreakdownViewMode = photoViewState.key === carouselKey ? photoViewState.mode : "final";
+
+  const setChosenFacePhotoIndex = (nextIndex: number) => {
+    const clamped = Math.max(0, Math.min(carouselMaxIndex, nextIndex));
+    setCarouselState({ key: carouselKey, index: clamped });
+  };
+  const setActivePhotoViewMode = (mode: PhotoBreakdownViewMode) => {
+    setPhotoViewState({ key: carouselKey, mode });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -407,10 +544,6 @@ export function PipelineDashboard({ backendUrl }: Props) {
 
   return (
     <div className="space-y-5">
-      <header className="rounded-xl border border-border bg-card px-5 py-4">
-        <h1 className="text-xl font-semibold tracking-tight">Phia Personalization (Behind the Scenes)</h1>
-      </header>
-
       <section className="rounded-xl border border-border bg-card p-4">
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">Jobs</h2>
         <div className="flex gap-3 overflow-x-auto pb-1">
@@ -453,7 +586,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
           <div className="grid gap-4 xl:grid-cols-3">
             <section className="space-y-3 xl:col-span-1">
               <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Uploaded Photos</h3>
-              <div className="space-y-3">
+              <div className="h-[520px] space-y-3 overflow-y-auto pr-1">
                 {detail.photos.map((photo) => {
                   const detections = detectionsByPhoto.get(photo.id) ?? [];
                   const aspect =
@@ -462,8 +595,8 @@ export function PipelineDashboard({ backendUrl }: Props) {
                       : 1;
                   return (
                     <div key={photo.id} className="rounded-lg border border-border bg-muted p-2">
-                      <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-3">
-                        <img src={photo.url} alt="uploaded" className="h-24 w-full rounded-md object-cover" />
+                      <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-3">
+                        <img src={photo.url} alt="uploaded" className="h-20 w-full rounded-md object-cover" />
                         <div>
                           <div className="mb-1 flex items-center justify-between">
                             <span className="font-mono text-[11px] text-muted-foreground">{photo.id.slice(0, 6)}</span>
@@ -473,9 +606,9 @@ export function PipelineDashboard({ backendUrl }: Props) {
                             {detections.map((det) => (
                               <div
                                 key={det.id}
-                                className="relative h-12 w-12 overflow-hidden rounded-full border border-border bg-card"
+                                className="relative h-10 w-10 overflow-hidden rounded-full border border-border bg-card"
                               >
-                                <img src={photo.url} alt="face crop" style={getFaceCropStyle(det.bbox, aspect, 48)} />
+                                <img src={photo.url} alt="face crop" style={getFaceCropStyle(det.bbox, aspect, 40)} />
                               </div>
                             ))}
                           </div>
@@ -489,7 +622,8 @@ export function PipelineDashboard({ backendUrl }: Props) {
 
             <section className="space-y-3 xl:col-span-1">
               <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Aggregated Faces</h3>
-              <div className="grid grid-cols-3 gap-3 lg:grid-cols-4">
+              <div className="h-[520px] overflow-y-auto pr-1">
+                <div className="grid grid-cols-3 gap-3 lg:grid-cols-4">
                 {detail.clusters.map((cluster) => (
                   <button
                     key={cluster.id}
@@ -500,17 +634,18 @@ export function PipelineDashboard({ backendUrl }: Props) {
                       detail.selected_cluster_id === cluster.id ? "border-accent" : "border-border"
                     }`}
                   >
-                    <div className="relative mx-auto h-14 w-14 overflow-hidden rounded-full border border-border bg-card">
+                    <div className="relative mx-auto h-12 w-12 overflow-hidden rounded-full border border-border bg-card">
                       <img
                         src={cluster.source_url}
                         alt="aggregated face"
-                        style={getFaceCropStyle(cluster.rep_bbox, cluster.rep_aspect_ratio ?? 1, 56)}
+                        style={getFaceCropStyle(cluster.rep_bbox, cluster.rep_aspect_ratio ?? 1, 48)}
                       />
                     </div>
                     <div className="mt-1 text-xs font-semibold">{cluster.member_count}</div>
                     <div className="text-[10px] text-muted-foreground">photos</div>
                   </button>
                 ))}
+                </div>
               </div>
             </section>
 
@@ -518,27 +653,29 @@ export function PipelineDashboard({ backendUrl }: Props) {
               <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                 {`Google Image Response For "${personName}"`}
               </h3>
-              <div className="grid grid-cols-3 gap-2 lg:grid-cols-4">
-                {visibleSerpUrls.slice(0, 24).map((url, idx) => (
-                  <a
-                    key={`${idx}-${url}`}
-                    href={url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={`overflow-hidden rounded-md border bg-muted ${
-                      selectedMatchedUrlKeySet.has(imageKey(url))
-                        ? "border-4 border-emerald-600"
-                        : "border-border"
-                    }`}
-                  >
-                    <img
-                      src={url}
-                      alt=""
-                      className="h-16 w-full object-cover"
-                      onError={() => setVisibleSerpUrls((prev) => prev.filter((u) => u !== url))}
-                    />
-                  </a>
-                ))}
+              <div className="h-[520px] overflow-y-auto pr-1">
+                <div className="grid grid-cols-3 gap-2 lg:grid-cols-4">
+                  {visibleSerpUrls.slice(0, 24).map((url, idx) => (
+                    <a
+                      key={`${idx}-${url}`}
+                      href={url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={`overflow-hidden rounded-md border bg-muted ${
+                        selectedMatchedUrlKeySet.has(imageKey(url))
+                          ? "border-4 border-emerald-600"
+                          : "border-border"
+                      }`}
+                    >
+                      <img
+                        src={url}
+                        alt=""
+                        className="h-12 w-full object-cover"
+                        onError={() => setVisibleSerpUrls((prev) => prev.filter((u) => u !== url))}
+                      />
+                    </a>
+                  ))}
+                </div>
               </div>
             </section>
           </div>
@@ -620,101 +757,266 @@ export function PipelineDashboard({ backendUrl }: Props) {
               </div>
             ) : (
               <div className="space-y-3">
-                <div className="grid gap-3 lg:grid-cols-2">
-                  <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Photos With Chosen Face
+                <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2">
+                  <button
+                    type="button"
+                    onClick={() => setChosenFacePhotoIndex(chosenFacePhotoIndex - 1)}
+                    disabled={chosenFacePhotoIndex === 0}
+                    className="rounded border border-border bg-background px-2 py-1 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    ← Previous
+                  </button>
+                  <div className="text-xs font-semibold text-muted-foreground">
+                    Photo {chosenFacePhotoIndex + 1} of {chosenFacePhotoRows.length}
                   </div>
-                  <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Products In This Photo
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setChosenFacePhotoIndex(chosenFacePhotoIndex + 1)}
+                    disabled={chosenFacePhotoIndex >= chosenFacePhotoRows.length - 1}
+                    className="rounded border border-border bg-background px-2 py-1 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Next →
+                  </button>
                 </div>
 
-                {chosenFacePhotoRows.map(({ photo, items }) => {
-                  const photoAspect =
-                    (photo.width ?? 0) > 0 && (photo.height ?? 0) > 0
-                      ? `${photo.width} / ${photo.height}`
-                      : "1 / 1";
-                  return (
-                    <div key={photo.id} className="grid gap-3 rounded-lg border border-border bg-card p-3 lg:grid-cols-2">
-                    <section>
+                {activeChosenFaceRow ? (
+                  (() => {
+                    const { photo, items } = activeChosenFaceRow;
+                    const photoAspect =
+                      photo.width && photo.height && photo.height > 0
+                        ? photo.width / photo.height
+                        : 1;
+                    const step = clothingStepByPhoto.get(photo.id);
+                    const yoloOutput = step?.yolo_world_detections ?? [];
+                    const gptCleaned = step?.gpt_cleaned_items ?? [];
+                    const finalBoxes: Array<{ description?: string; bounding_box?: StepBox }> = gptCleaned.map((item) => ({
+                      description: item.description,
+                      bounding_box: item.bounding_box,
+                    }));
+
+                    const modeLabel =
+                      activePhotoViewMode === "original"
+                        ? "Original Image"
+                        : activePhotoViewMode === "vlm"
+                          ? "VLM output"
+                          : "Final Image";
+                    const modeCount =
+                      activePhotoViewMode === "original"
+                        ? 0
+                        : activePhotoViewMode === "vlm"
+                          ? yoloOutput.length
+                          : finalBoxes.length;
+                    const legendEntries =
+                      activePhotoViewMode === "vlm"
+                        ? yoloOutput.map((det, idx) => ({
+                            index: idx + 1,
+                            text: `${(det.label || "unknown").toLowerCase()} ${(Number(det.confidence || 0) * 100).toFixed(0)}%`,
+                          }))
+                        : activePhotoViewMode === "final"
+                          ? finalBoxes.map((item, idx) => ({
+                              index: idx + 1,
+                              text: item.description || "item",
+                            }))
+                          : [];
+
+                    return (
                       <div
-                        className="relative w-full overflow-hidden rounded-md border border-border bg-background"
-                        style={{ aspectRatio: photoAspect }}
+                        key={photo.id}
+                        className="grid h-[780px] gap-3 overflow-y-auto rounded-lg border border-border bg-card p-3 lg:grid-cols-[180px_minmax(0,1fr)]"
                       >
-                        <img src={photo.url} alt="item boxes overlay" className="absolute inset-0 h-full w-full object-fill" />
-                        {items.map((item) => (
-                          <div key={`${photo.id}-${item.id}`} className="pointer-events-none absolute" style={getItemBoxStyle(item.bounding_box)}>
-                            <div className="h-full w-full border-2 border-sky-500" />
-                            <span className="absolute left-0 top-0 bg-sky-500 px-1 py-0.5 text-[10px] font-semibold text-white">
-                              {item.category}
-                            </span>
+                        <aside className="space-y-2 rounded-md border border-border bg-background p-2">
+                          <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Image View</div>
+                          <button
+                            type="button"
+                            onClick={() => setActivePhotoViewMode("original")}
+                            className={`w-full rounded border px-2 py-2 text-left text-xs font-semibold ${
+                              activePhotoViewMode === "original" ? "border-accent bg-accent/10" : "border-border bg-card"
+                            }`}
+                          >
+                            Original Image
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setActivePhotoViewMode("vlm")}
+                            className={`w-full rounded border px-2 py-2 text-left text-xs font-semibold ${
+                              activePhotoViewMode === "vlm" ? "border-accent bg-accent/10" : "border-border bg-card"
+                            }`}
+                          >
+                            VLM output
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setActivePhotoViewMode("final")}
+                            className={`w-full rounded border px-2 py-2 text-left text-xs font-semibold ${
+                              activePhotoViewMode === "final" ? "border-accent bg-accent/10" : "border-border bg-card"
+                            }`}
+                          >
+                            Final Image
+                          </button>
+                          <div className="pt-1 text-[11px] text-muted-foreground">
+                            <div>photo {photo.id.slice(0, 8)}</div>
+                            <div className="mt-1">{modeLabel}</div>
+                            <div>{modeCount} boxes</div>
+                            <div className="mt-1">YOLO: {yoloOutput.length}</div>
                           </div>
+                        </aside>
+
+                        <section className="space-y-3">
+                          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_220px] md:items-start">
+                            <div
+                              className="relative mx-auto w-full max-w-[360px] overflow-hidden rounded-md border border-border bg-background"
+                              style={{ aspectRatio: photoAspect }}
+                            >
+                              <img src={photo.url} alt="photo breakdown image" className="absolute inset-0 h-full w-full object-contain" />
+                              {activePhotoViewMode === "vlm"
+                                ? yoloOutput.map((det, idx) => (
+                                    <div
+                                      key={`${photo.id}-vlm-box-${idx}`}
+                                      className="pointer-events-none absolute"
+                                      style={getYoloBoxStyle(det.bbox, photo.width, photo.height)}
+                                    >
+                                      <div className="h-full w-full border-2 border-orange-500" />
+                                      <span className="absolute left-0 top-0 rounded-br bg-orange-500 px-1.5 py-0.5 text-[10px] font-semibold text-black">
+                                        {idx + 1}
+                                      </span>
+                                    </div>
+                                  ))
+                                : null}
+                              {activePhotoViewMode === "final"
+                                ? finalBoxes.map((item, idx) => (
+                                    <div
+                                      key={`${photo.id}-final-box-${idx}`}
+                                      className="pointer-events-none absolute"
+                                      style={getItemBoxStyle(item.bounding_box)}
+                                    >
+                                      <div className="h-full w-full border-2 border-red-500" />
+                                      <span className="absolute left-0 top-0 rounded-br bg-red-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                                        {idx + 1}
+                                      </span>
+                                    </div>
+                                  ))
+                                : null}
+                            </div>
+
+                            {activePhotoViewMode !== "original" ? (
+                              <aside className="rounded-md border border-border bg-background p-2">
+                                <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                  {activePhotoViewMode === "vlm" ? "VLM Labels" : "Final Labels"}
+                                </div>
+                                <div className="mt-2 max-h-[360px] space-y-1 overflow-y-auto pr-1">
+                                  {legendEntries.length === 0 ? (
+                                    <div className="text-xs text-muted-foreground">No detections yet.</div>
+                                  ) : (
+                                    legendEntries.map((entry) => (
+                                      <div key={`${photo.id}-legend-${entry.index}`} className="flex items-start gap-2 rounded border border-border bg-card px-2 py-1">
+                                        <span
+                                          className={`mt-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded text-[10px] font-semibold ${
+                                            activePhotoViewMode === "vlm"
+                                              ? "bg-orange-500 text-black"
+                                              : "bg-red-600 text-white"
+                                          }`}
+                                        >
+                                          {entry.index}
+                                        </span>
+                                        <span className="text-xs text-foreground">{entry.text}</span>
+                                      </div>
+                                    ))
+                                  )}
+                                </div>
+                              </aside>
+                            ) : null}
+                          </div>
+
+                          <section>
+                            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              Products In This Photo
+                            </div>
+                            <div className="h-64 overflow-y-auto pr-1">
+                              {items.length === 0 ? (
+                                <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                                  No extracted items yet.
+                                </div>
+                              ) : (
+                                (() => {
+                                  const matchedProducts = items
+                                    .map((item) => ({ item, match: item.best_match }))
+                                    .filter((entry) => !!entry.match?.link);
+
+                                  if (matchedProducts.length === 0) {
+                                    return (
+                                      <div className="rounded-md border border-dashed border-border px-2 py-1 text-[11px] text-muted-foreground">
+                                        Serp lookup pending / no strong match yet.
+                                      </div>
+                                    );
+                                  }
+
+                                  return (
+                                    <div className="flex gap-3 overflow-x-auto pb-2">
+                                      {matchedProducts.map(({ item, match }) => (
+                                        <a
+                                          key={`${item.id}-${match?.link || "match"}`}
+                                          href={match?.link}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="w-36 shrink-0 rounded-md border border-border bg-background p-2"
+                                        >
+                                          {match?.thumbnail ? (
+                                            <img src={match.thumbnail} alt={match.title || "matched product"} className="h-32 w-32 rounded object-cover" />
+                                          ) : (
+                                            <div className="h-32 w-32 rounded bg-muted" />
+                                          )}
+                                          <div className="mt-2 truncate text-xs font-semibold">{match?.title || "Matched product"}</div>
+                                          <div className="text-[11px] text-muted-foreground">
+                                            {match?.price || "Price unavailable"}
+                                          </div>
+                                        </a>
+                                      ))}
+                                    </div>
+                                  );
+                                })()
+                              )}
+                            </div>
+                          </section>
+                        </section>
+                      </div>
+                    );
+                  })()
+                ) : null}
+
+                <section className="rounded-lg border border-border bg-card p-3">
+                  <div className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                    Closet
+                  </div>
+                  {closetProducts.length === 0 ? (
+                    <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                      No product items found yet.
+                    </div>
+                  ) : (
+                    <div className="max-h-[720px] overflow-y-auto pr-1">
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+                        {closetProducts.map(({ item, match }) => (
+                          <a
+                            key={`closet-${item.id}-${match?.link || "match"}`}
+                            href={match?.link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="rounded-md border border-border bg-background p-2"
+                          >
+                            {match?.thumbnail ? (
+                              <img src={match.thumbnail} alt={match.title || item.description} className="h-28 w-full rounded object-cover" />
+                            ) : (
+                              <div className="h-28 w-full rounded bg-muted" />
+                            )}
+                            <div className="mt-2 truncate text-xs font-semibold">{match?.title || item.description}</div>
+                            <div className="text-[11px] text-muted-foreground">
+                              {match?.price || "Price unavailable"}
+                            </div>
+                          </a>
                         ))}
                       </div>
-                      <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-                        <span>photo {photo.id.slice(0, 8)}</span>
-                        <span>{items.length} items detected</span>
-                      </div>
-                    </section>
-
-                    <section>
-                      {items.length === 0 ? (
-                        <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
-                          No extracted items yet.
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          {items.map((item) => {
-                            const match = item.best_match;
-                            return (
-                              <div key={item.id} className="rounded-md border border-border bg-background p-2">
-                                <div className="flex items-start gap-2">
-                                  {item.crop_url ? (
-                                    <img src={item.crop_url} alt="item crop" className="h-12 w-12 rounded object-cover" />
-                                  ) : (
-                                    <div className="h-12 w-12 rounded bg-muted" />
-                                  )}
-                                  <div className="min-w-0 flex-1">
-                                    <div className="truncate text-xs font-semibold">{item.description}</div>
-                                    <div className="text-[11px] text-muted-foreground">
-                                      {item.category} • {item.tier}
-                                    </div>
-                                  </div>
-                                </div>
-                                {match?.link ? (
-                                  <a
-                                    href={match.link}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="mt-2 flex items-center gap-2 rounded border border-border bg-card p-2"
-                                  >
-                                    {match.thumbnail ? (
-                                      <img src={match.thumbnail} alt="matched product" className="h-10 w-10 rounded object-cover" />
-                                    ) : (
-                                      <div className="h-10 w-10 rounded bg-muted" />
-                                    )}
-                                    <div className="min-w-0 flex-1">
-                                      <div className="truncate text-xs font-semibold">{match.title || "Matched product"}</div>
-                                      <div className="text-[11px] text-muted-foreground">
-                                        {match.source || "Unknown source"}
-                                        {match.price ? ` • ${match.price}` : ""}
-                                      </div>
-                                    </div>
-                                  </a>
-                                ) : (
-                                  <div className="mt-2 rounded border border-dashed border-border px-2 py-1 text-[11px] text-muted-foreground">
-                                    Product lookup pending / no strong match yet.
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </section>
-                  </div>
-                  );
-                })}
+                    </div>
+                  )}
+                </section>
               </div>
             )}
           </section>

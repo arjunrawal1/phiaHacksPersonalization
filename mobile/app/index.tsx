@@ -131,7 +131,7 @@ interface SearchBrandTile {
   image: string;
 }
 
-const MOST_RECENT_LIMIT = 3;
+const MOST_RECENT_LIMIT = 10;
 const POLL_MS = 1500;
 const MAX_DIMENSION = 1920;
 const FACE_PICKER_CIRCLE_SIZE = 72;
@@ -1396,8 +1396,8 @@ export default function Index() {
           <View style={styles.termsCard}>
             <Text style={styles.termsTitle}>Sync camera roll</Text>
             <Text style={styles.termsBody}>
-              By continuing, phia will request iOS photo permission and upload your 3 most recent photos to
-              extract clothing insights and personalize your shopping experience.
+              By continuing, phia will request iOS photo permission and upload your {MOST_RECENT_LIMIT} most
+              recent photos to extract clothing insights and personalize your shopping experience.
             </Text>
             <Text style={styles.termsFootnote}>You can revoke photo access any time in iOS Settings.</Text>
 

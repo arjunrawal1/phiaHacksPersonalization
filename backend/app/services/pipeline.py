@@ -47,17 +47,6 @@ ONLINE_SEARCH_TIMEOUT_SECONDS = 20
 ONLINE_IMAGE_TIMEOUT_SECONDS = 8
 ONLINE_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
-CATEGORY_QUERY_TERMS: dict[str, list[str]] = {
-    "top": ["shirt", "top", "sweater", "t-shirt", "blouse"],
-    "bottom": ["pants", "trousers", "shorts", "skirt", "jeans"],
-    "dress": ["dress", "gown"],
-    "outerwear": ["jacket", "coat", "hoodie", "blazer"],
-    "shoes": ["shoes", "sneakers", "boots"],
-    "hat": ["hat", "cap", "beanie"],
-    "bag": ["bag", "backpack", "purse", "handbag"],
-    "accessory": ["watch", "bracelet", "necklace", "tie", "sunglasses", "belt"],
-}
-
 YOLO_WORLD_CLASS_NAMES: list[str] = [
     "shirt",
     "polo shirt",
@@ -288,6 +277,7 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
             "tier": i["tier"],
             "exact_matches": i["exact_matches"],
             "similar_products": i["similar_products"],
+            "phia_products": i.get("phia_products") or [],
             "best_match": i.get("best_match"),
             "best_match_confidence": i.get("best_match_confidence") or 0,
         }
@@ -1267,7 +1257,7 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                 job_id,
                 patch={
                     "stages": {"clothing_extraction": "complete"},
-                    "clothing_extraction": {"item_count": 0, "photo_count": 0},
+                    "clothing_extraction": {"item_count": 0, "photo_count": 0, "per_photo_steps": []},
                 },
                 event={
                     "type": "clothing_extraction_complete",
@@ -1285,33 +1275,110 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                 bbox_by_photo[det["photo_id"]] = det["bbox"]
 
         item_ids: list[str] = []
+        per_photo_steps: list[dict[str, Any]] = []
         entries = list(bbox_by_photo.items())
 
-        def process_one(entry: tuple[str, dict[str, float]]) -> list[str]:
+        def process_one(entry: tuple[str, dict[str, float]]) -> dict[str, Any]:
             photo_id, face_bbox = entry
             photo = photos.get(photo_id)
             if not photo:
-                return []
+                return {
+                    "item_ids": [],
+                    "step": {
+                        "photo_id": photo_id,
+                        "reason": "missing_photo_record",
+                        "yolo_world_detections": [],
+                        "gpt_cleaned_items": [],
+                        "visible_items": [],
+                        "inserted_item_count": 0,
+                    },
+                }
 
             photo_path = settings.media_dir / photo["relative_path"]
             face_tile_rel = _save_face_tile(photo_path, job_id, photo_id, face_bbox)
             face_tile_path = settings.media_dir / face_tile_rel
 
+            step: dict[str, Any] = {
+                "photo_id": photo_id,
+                "photo_relative_path": photo["relative_path"],
+                "yolo_world_detections": [],
+                "gpt_cleaned_items": [],
+                "visible_items": [],
+                "inserted_item_count": 0,
+                "postprocess_source": "fallback",
+                "yolo_requested_source": "default",
+                "yolo_requested_classes": YOLO_WORLD_CLASS_NAMES[:],
+                "gpt_identified_classes": [],
+            }
+
             external_photo_url = _external_media_url(photo["relative_path"])
+            step["external_photo_url"] = external_photo_url
             if not external_photo_url:
-                return []
+                step["reason"] = "missing_external_photo_url"
+                return {"item_ids": [], "step": step}
+
+            gpt_classes = _identify_yolo_classes_with_openai(
+                photo_path=photo_path,
+                face_bbox=face_bbox,
+                face_tile_path=face_tile_path,
+            )
+            step["gpt_identified_classes"] = gpt_classes[:60]
+            yolo_classes = gpt_classes if gpt_classes else YOLO_WORLD_CLASS_NAMES
+            step["yolo_requested_classes"] = yolo_classes[:60]
+            step["yolo_requested_source"] = "gpt" if gpt_classes else "default"
 
             # YOLO-World is the source of truth for regions; GPT only filters/selects among these boxes.
-            detections = _detect_objects(external_photo_url)
+            yolo_debug: dict[str, Any] = {}
+            detections = _detect_objects(external_photo_url, class_names=yolo_classes, debug=yolo_debug)
+            step["yolo_debug"] = yolo_debug
+            step["yolo_world_detections"] = [
+                {
+                    "label": str(det.get("label") or ""),
+                    "confidence": float(det.get("confidence") or 0),
+                    "bbox": [float(v) for v in (det.get("bbox") or [])[:4]],
+                }
+                for det in detections
+            ][:120]
             if not detections:
-                return []
+                if str(yolo_debug.get("status") or "") in {"failed", "exception", "skipped"}:
+                    step["reason"] = "yolo_error"
+                else:
+                    step["reason"] = "no_yolo_detections"
+                return {"item_ids": [], "step": step}
 
-            items = _extract_items_from_detections(photo_path, face_bbox, face_tile_path, detections)
-            visible = [
-                i for i in items if i.get("visibility", "clear") != "obscured" and float(i.get("confidence", 0)) >= 0.35
-            ]
+            items, postprocess_source = _extract_items_from_detections(
+                photo_path,
+                face_bbox,
+                face_tile_path,
+                detections,
+            )
+            step["postprocess_source"] = postprocess_source
+            step["gpt_cleaned_items"] = [
+                {
+                    "category": str(item.get("category") or ""),
+                    "confidence": float(item.get("confidence") or 0),
+                    "visibility": str(item.get("visibility") or "clear"),
+                    "description": str(item.get("description") or ""),
+                    "bounding_box": item.get("bounding_box") or {},
+                }
+                for item in items
+            ][:80]
+            # Temporary: allow low-confidence items through to product lookup.
+            # We only block items explicitly marked as obscured.
+            visible = [i for i in items if i.get("visibility", "clear") != "obscured"]
+            step["visible_items"] = [
+                {
+                    "category": str(item.get("category") or ""),
+                    "confidence": float(item.get("confidence") or 0),
+                    "visibility": str(item.get("visibility") or "clear"),
+                    "description": str(item.get("description") or ""),
+                    "bounding_box": item.get("bounding_box") or {},
+                }
+                for item in visible
+            ][:80]
             if not visible:
-                return []
+                step["reason"] = "all_items_filtered"
+                return {"item_ids": [], "step": step}
 
             inserted: list[str] = []
             for item in visible:
@@ -1325,7 +1392,7 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                 item_id = db.insert_clothing_item(
                     job_id=job_id,
                     photo_id=photo_id,
-                    category=item.get("category", "top"),
+                    category=item.get("category") or item.get("description") or "clothing item",
                     description=item.get("description", "Unlabeled clothing item"),
                     colors=item.get("colors", []),
                     pattern=item.get("pattern", ""),
@@ -1338,21 +1405,28 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                     tier="pending",
                     exact_matches=[],
                     similar_products=[],
+                    phia_products=[],
                     best_match=None,
                     best_match_confidence=0,
                 )
                 inserted.append(item_id)
 
-            return inserted
+            step["inserted_item_count"] = len(inserted)
+            step["inserted_item_ids"] = inserted[:80]
+            step["reason"] = "inserted_items"
+            return {"item_ids": inserted, "step": step}
 
         concurrency = max(1, settings.photo_concurrency)
         if concurrency == 1:
             for entry in entries:
-                item_ids.extend(process_one(entry))
+                result = process_one(entry)
+                item_ids.extend(result.get("item_ids", []))
+                per_photo_steps.append(result.get("step", {}))
         else:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                for ids in pool.map(process_one, entries):
-                    item_ids.extend(ids)
+                for result in pool.map(process_one, entries):
+                    item_ids.extend(result.get("item_ids", []))
+                    per_photo_steps.append(result.get("step", {}))
 
         db.update_job(job_id, status="done", error=None)
         _debug_patch(
@@ -1363,6 +1437,7 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                     "item_count": len(item_ids),
                     "photo_count": len(entries),
                     "finished_at": db.utc_now_iso(),
+                    "per_photo_steps": per_photo_steps[:120],
                 },
             },
             event={
@@ -1405,6 +1480,11 @@ def _lookup_item_worker(item_id: str) -> None:
                     bbox=item["bounding_box"],
                 )
 
+        crop_path = settings.media_dir / (crop_rel or "")
+        crop_path_for_lookup = crop_path if crop_path.exists() else None
+
+        phia_products: list[dict[str, Any]] = []
+
         exact_matches: list[dict[str, Any]] = []
         similar_products: list[dict[str, Any]] = []
         tier: str = "generic"
@@ -1434,12 +1514,11 @@ def _lookup_item_worker(item_id: str) -> None:
             if photo:
                 photo_path = settings.media_dir / photo["relative_path"]
                 face_tile_path = settings.media_dir / f"face_tiles/{item['job_id']}/{item['photo_id']}.jpg"
-                crop_path = settings.media_dir / (crop_rel or "")
 
                 ranked = _rank_candidates(
                     photo_path=photo_path,
                     face_tile_path=face_tile_path if face_tile_path.exists() else None,
-                    crop_path=crop_path if crop_path.exists() else None,
+                    crop_path=crop_path_for_lookup,
                     description=item.get("description") or "",
                     candidates=candidates,
                 )
@@ -1471,6 +1550,7 @@ def _lookup_item_worker(item_id: str) -> None:
             tier=final_tier,
             exact_matches=exact_matches,
             similar_products=similar_products,
+            phia_products=phia_products,
             best_match=best_match,
             best_match_confidence=best_confidence,
             crop_path=crop_rel,
@@ -1605,12 +1685,123 @@ def _cosine(a: Any, b: Any) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+def _normalize_yolo_class_names(values: list[Any], *, max_items: int = 40) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        text = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        if not text:
+            continue
+        if len(text) > 60:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _identify_yolo_classes_with_openai(
+    *,
+    photo_path: Path,
+    face_bbox: dict[str, float],
+    face_tile_path: Path | None,
+) -> list[str]:
+    settings = _settings()
+    if not settings.openai_api_key:
+        return []
+
+    fbb = face_bbox
+    face_desc = (
+        f"face at normalized coordinates (x={fbb['left']:.3f}, y={fbb['top']:.3f}, "
+        f"width={fbb['width']:.3f}, height={fbb['height']:.3f})"
+    )
+    instructions = (
+        "Identify the clothing that the person with this face has on.\n"
+        "Return short detector-friendly class names (1-3 words each).\n"
+        "Good classes include: red shirt, blue gown, white tie, white shoes.\n"
+        "If color is unclear, use the uncolored class name (for example: shirt, gown, tie, shoes).\n"
+        "Do not include background objects, other people, body parts, or generic words.\n"
+        f"Target hint: {face_desc}"
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "class_names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 0,
+                "maxItems": 40,
+            }
+        },
+        "required": ["class_names"],
+        "additionalProperties": False,
+    }
+
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": instructions}]
+    if face_tile_path and face_tile_path.exists():
+        content.append({"type": "input_image", "image_url": _data_url_for_image(face_tile_path), "detail": "high"})
+    content.append({"type": "input_image", "image_url": _data_url_for_image(photo_path), "detail": "high"})
+
+    payload = {
+        "model": settings.openai_model,
+        "reasoning": {"effort": "low"},
+        "input": [{"role": "user", "content": content}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "class_name_identification",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(TAG, "openai class identification failed", exc)
+        return []
+
+    raw = data.get("output_text")
+    if not raw:
+        for out in data.get("output", []):
+            for c in out.get("content", []):
+                if c.get("type") == "output_text" and c.get("text"):
+                    raw = c["text"]
+                    break
+            if raw:
+                break
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    class_names = parsed.get("class_names") if isinstance(parsed, dict) else None
+    if not isinstance(class_names, list):
+        return []
+    return _normalize_yolo_class_names(class_names, max_items=40)
+
+
 def _extract_items_from_detections(
     photo_path: Path,
     face_bbox: dict[str, float],
     face_tile_path: Path | None,
     detections: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
     settings = _settings()
     if settings.openai_api_key:
         try:
@@ -1621,13 +1812,13 @@ def _extract_items_from_detections(
                 detections=detections,
             )
             if extracted:
-                return extracted
+                return extracted, "openai"
         except Exception as exc:
             print(TAG, "openai detection postprocess failed", exc)
 
     with Image.open(photo_path).convert("RGB") as image:
         img_w, img_h = image.size
-    return _fallback_items_from_detections(detections, img_w, img_h)
+    return _fallback_items_from_detections(detections, img_w, img_h), "fallback"
 
 
 def _extract_items_from_detections_with_openai(
@@ -1655,10 +1846,6 @@ def _extract_items_from_detections_with_openai(
                     "type": "object",
                     "properties": {
                         "detection_index": {"type": "integer"},
-                        "category": {
-                            "type": "string",
-                            "enum": ["top", "bottom", "dress", "outerwear", "shoes", "hat", "bag", "accessory"],
-                        },
                         "description": {"type": "string"},
                         "colors": {"type": "array", "items": {"type": "string"}},
                         "pattern": {"type": "string"},
@@ -1670,7 +1857,6 @@ def _extract_items_from_detections_with_openai(
                     },
                     "required": [
                         "detection_index",
-                        "category",
                         "description",
                         "colors",
                         "pattern",
@@ -1704,11 +1890,14 @@ def _extract_items_from_detections_with_openai(
     instructions = (
         "You are post-processing YOLO-World detections for one target person.\n"
         "Important rules:\n"
-        "1) Only choose detections worn by the target person from the face crop.\n"
+        "1) Remove boxes that are not on the target with this face. Only choose detections worn by this target person.\n"
         "2) Do NOT invent, redraw, or move bounding boxes. You may only choose from listed detection indices.\n"
         "3) Exclude detections on other people or background objects (even if clothing-looking).\n"
-        "4) For accessories, especially bracelets/wristbands: if crop is tiny, blurry, or not visually recognizable, set crop_quality='bad' so it is removed.\n"
-        "5) Keep only useful crops for downstream shopping lookup.\n"
+        "4) Use visual inference across the full scene: if multiple people wear the same item and the target likely wears it too, "
+        "choose the nearest visually similar detection index to the target as a proxy, and remove the rest for that item.\n"
+        "5) For duplicate boxes of the same item, keep the nearest one to the target and reject the others.\n"
+        "6) For accessories, especially bracelets/wristbands: if crop is tiny, blurry, or not visually recognizable, set crop_quality='bad' so it is removed.\n"
+        "7) Keep only useful crops for downstream shopping lookup.\n"
         f"Target hint: {face_desc}\n"
         "Detections (in order):\n"
         + "\n".join(detection_lines)
@@ -1774,6 +1963,9 @@ def _extract_items_from_detections_with_openai(
 
     parsed = json.loads(raw)
     selected = parsed.get("selected_items", []) or []
+    face_center_x = float(face_bbox["left"]) + float(face_bbox["width"]) / 2.0
+    face_center_y = float(face_bbox["top"]) + float(face_bbox["height"]) / 2.0
+
     normalized: list[dict[str, Any]] = []
     used_indices: set[int] = set()
     for item in selected:
@@ -1788,9 +1980,14 @@ def _extract_items_from_detections_with_openai(
 
         det = candidates[det_idx]
         bbox = _detection_bbox_to_xywh(det["bbox"], img_w, img_h)
-        category = str(item.get("category") or _category_from_detector_label(str(det.get("label") or "")))
-        if category not in CATEGORY_QUERY_TERMS:
-            category = _category_from_detector_label(str(det.get("label") or ""))
+        box_center_x = float(bbox["x"]) + float(bbox["w"]) / 2.0
+        box_center_y = float(bbox["y"]) + float(bbox["h"]) / 2.0
+        distance_to_target = ((box_center_x - face_center_x) ** 2 + (box_center_y - face_center_y) ** 2) ** 0.5
+        detector_label = str(det.get("label") or "").strip().lower()
+        description = str(item.get("description") or "").strip()
+        if not description:
+            description = detector_label or "Detected clothing item"
+        category = description
 
         visibility = str(item.get("visibility") or "clear")
         confidence = float(item.get("confidence") or det.get("confidence") or 0)
@@ -1799,7 +1996,7 @@ def _extract_items_from_detections_with_openai(
         normalized.append(
             {
                 "category": category,
-                "description": item.get("description") or f"Detected {det.get('label') or 'clothing item'}",
+                "description": description,
                 "colors": item.get("colors") or ["unknown"],
                 "pattern": item.get("pattern") or "unknown",
                 "style": item.get("style") or "casual",
@@ -1807,11 +2004,37 @@ def _extract_items_from_detections_with_openai(
                 "bounding_box": bbox,
                 "visibility": visibility if visibility in {"clear", "partial", "obscured"} else "clear",
                 "confidence": confidence,
+                "_source_label": str(det.get("label") or "").strip().lower(),
+                "_distance_to_target": distance_to_target,
             }
         )
         used_indices.add(det_idx)
 
-    return normalized
+    # If multiple detections represent the same item, keep the nearest one to the target.
+    deduped_by_item: dict[str, dict[str, Any]] = {}
+    for item in normalized:
+        item_key = str(item.get("_source_label") or item.get("category") or "").strip().lower()
+        if not item_key:
+            continue
+        current = deduped_by_item.get(item_key)
+        if current is None:
+            deduped_by_item[item_key] = item
+            continue
+        current_dist = float(current.get("_distance_to_target") or 1e9)
+        next_dist = float(item.get("_distance_to_target") or 1e9)
+        if next_dist < current_dist:
+            deduped_by_item[item_key] = item
+            continue
+        if abs(next_dist - current_dist) <= 1e-6 and float(item.get("confidence") or 0) > float(current.get("confidence") or 0):
+            deduped_by_item[item_key] = item
+
+    out: list[dict[str, Any]] = []
+    for item in deduped_by_item.values():
+        cleaned = dict(item)
+        cleaned.pop("_source_label", None)
+        cleaned.pop("_distance_to_target", None)
+        out.append(cleaned)
+    return out
 
 
 def _detection_bbox_to_xywh(bbox: list[float], img_w: int, img_h: int) -> dict[str, float]:
@@ -1825,26 +2048,6 @@ def _detection_bbox_to_xywh(bbox: list[float], img_w: int, img_h: int) -> dict[s
         "w": max(0.01, min(1.0, (x2 - x1) / img_w)),
         "h": max(0.01, min(1.0, (y2 - y1) / img_h)),
     }
-
-
-def _category_from_detector_label(label: str) -> str:
-    text = label.lower()
-    if any(k in text for k in ("dress", "gown")):
-        return "dress"
-    if any(k in text for k in ("pants", "trouser", "chino", "jean", "short", "skirt")):
-        return "bottom"
-    if any(k in text for k in ("jacket", "coat", "hoodie", "blazer", "outerwear")):
-        return "outerwear"
-    if any(k in text for k in ("shoe", "sneaker", "boot", "loafer", "heel", "sandal")):
-        return "shoes"
-    if any(k in text for k in ("hat", "cap", "beanie")):
-        return "hat"
-    if any(k in text for k in ("bag", "backpack", "purse", "handbag")):
-        return "bag"
-    if any(k in text for k in ("watch", "bracelet", "necklace", "tie", "sunglasses", "belt", "ring")):
-        return "accessory"
-    return "top"
-
 
 def _crop_data_url_for_detection(photo_path: Path, bbox_xyxy: list[float], pad: float = 0.1) -> str | None:
     try:
@@ -1879,18 +2082,20 @@ def _fallback_items_from_detections(
     img_h: int,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    seen_major: set[str] = set()
+    seen_labels: set[str] = set()
     for det in sorted(detections, key=lambda d: float(d.get("confidence") or 0), reverse=True):
         conf = float(det.get("confidence") or 0)
         if conf < 0.18:
             continue
-        category = _category_from_detector_label(str(det.get("label") or ""))
-        if category in seen_major and category not in {"accessory"}:
+        detector_label = str(det.get("label") or "").strip().lower()
+        if not detector_label:
+            continue
+        if detector_label in seen_labels:
             continue
         out.append(
             {
-                "category": category,
-                "description": f"Detected {det.get('label') or category}",
+                "category": detector_label,
+                "description": detector_label,
                 "colors": ["unknown"],
                 "pattern": "unknown",
                 "style": "casual",
@@ -1900,24 +2105,49 @@ def _fallback_items_from_detections(
                 "confidence": min(0.95, conf),
             }
         )
-        if category != "accessory":
-            seen_major.add(category)
+        seen_labels.add(detector_label)
         if len(out) >= 6:
             break
     return out
 
 
-def _detect_objects(image_url: str) -> list[dict[str, Any]]:
+def _detect_objects(
+    image_url: str,
+    *,
+    class_names: list[str] | None = None,
+    debug: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    yolo_debug = debug if debug is not None else {}
     settings = _settings()
-    if not settings.replicate_api_token or not image_url:
+    if not settings.replicate_api_token:
+        yolo_debug["status"] = "skipped"
+        yolo_debug["error"] = "missing_replicate_api_token"
+        yolo_debug["detection_count"] = 0
         return []
+    if not image_url:
+        yolo_debug["status"] = "skipped"
+        yolo_debug["error"] = "missing_image_url"
+        yolo_debug["detection_count"] = 0
+        return []
+
+    chosen_classes = _normalize_yolo_class_names(class_names or [], max_items=60)
+    if not chosen_classes:
+        chosen_classes = YOLO_WORLD_CLASS_NAMES
+    yolo_debug["requested_class_count"] = len(chosen_classes)
+    yolo_debug["requested_classes"] = chosen_classes[:60]
+    yolo_debug["status"] = "running"
 
     try:
         version = _replicate_yolo_world_version(settings.replicate_api_token)
         if not version:
+            yolo_debug["status"] = "failed"
+            yolo_debug["error"] = "version_lookup_failed"
+            yolo_debug["detection_count"] = 0
             return []
+        yolo_debug["model_version"] = version
 
         start_data: dict[str, Any] | None = None
+        start_attempts: list[dict[str, Any]] = []
         for wait_s in (0, 8, 16):
             if wait_s:
                 time.sleep(wait_s)
@@ -1932,7 +2162,7 @@ def _detect_objects(image_url: str) -> list[dict[str, Any]]:
                     "version": version,
                     "input": {
                         "input_media": image_url,
-                        "class_names": ",".join(YOLO_WORLD_CLASS_NAMES),
+                        "class_names": ",".join(chosen_classes),
                         "max_num_boxes": 120,
                         "nms_thr": 0.6,
                         "score_thr": 0.1,
@@ -1941,20 +2171,33 @@ def _detect_objects(image_url: str) -> list[dict[str, Any]]:
                 },
                 timeout=40,
             )
+            start_attempts.append({"wait_seconds": wait_s, "http_status": int(start.status_code)})
             if start.status_code == 429:
                 continue
             if start.status_code >= 300:
+                yolo_debug["status"] = "failed"
+                yolo_debug["start_attempts"] = start_attempts
+                yolo_debug["error"] = f"start_http_{int(start.status_code)}"
+                yolo_debug["error_body"] = (start.text or "")[:400]
+                yolo_debug["detection_count"] = 0
                 return []
             start_data = start.json()
             break
 
         if not start_data:
+            yolo_debug["status"] = "failed"
+            yolo_debug["start_attempts"] = start_attempts
+            yolo_debug["error"] = "start_failed_no_response"
+            yolo_debug["detection_count"] = 0
             return []
+        yolo_debug["start_attempts"] = start_attempts
 
         data = start_data
+        yolo_debug["prediction_status"] = str(data.get("status") or "")
         if data.get("status") not in {"succeeded", "failed", "canceled"} and data.get("urls", {}).get("get"):
             poll_url = data["urls"]["get"]
             deadline = time.time() + 30
+            poll_count = 0
             while time.time() < deadline:
                 time.sleep(1)
                 poll = requests.get(
@@ -1963,12 +2206,20 @@ def _detect_objects(image_url: str) -> list[dict[str, Any]]:
                     timeout=30,
                 )
                 if poll.status_code >= 300:
+                    yolo_debug["poll_error_http_status"] = int(poll.status_code)
                     break
                 data = poll.json()
+                poll_count += 1
+                yolo_debug["prediction_status"] = str(data.get("status") or "")
                 if data.get("status") in {"succeeded", "failed", "canceled"}:
                     break
+            yolo_debug["poll_count"] = poll_count
 
         if data.get("status") != "succeeded":
+            yolo_debug["status"] = "failed"
+            yolo_debug["prediction_status"] = str(data.get("status") or "")
+            yolo_debug["error"] = str(data.get("error") or "prediction_not_succeeded")
+            yolo_debug["detection_count"] = 0
             return []
 
         dets: list[dict[str, Any]] = []
@@ -2009,8 +2260,14 @@ def _detect_objects(image_url: str) -> list[dict[str, Any]]:
             out.append({"bbox": bbox, "label": label, "confidence": confidence})
 
         out.sort(key=lambda d: float(d.get("confidence") or 0), reverse=True)
+        yolo_debug["status"] = "succeeded"
+        yolo_debug["prediction_status"] = "succeeded"
+        yolo_debug["detection_count"] = len(out)
         return out
-    except Exception:
+    except Exception as exc:
+        yolo_debug["status"] = "exception"
+        yolo_debug["error"] = str(exc)
+        yolo_debug["detection_count"] = 0
         return []
 
 
