@@ -131,10 +131,11 @@ interface SearchBrandTile {
   image: string;
 }
 
-const MOST_RECENT_LIMIT = 1;
+const MOST_RECENT_LIMIT = 3;
 const POLL_MS = 1500;
 const MAX_DIMENSION = 1920;
 const FACE_PICKER_CIRCLE_SIZE = 72;
+const CURRENT_USER_NAME = 'arjun rawal';
 
 const HERO_CARDS: HeroCard[] = [
   {
@@ -327,9 +328,9 @@ function statusLabel(status: SyncStatus): string {
     case 'requesting-permission':
       return 'Requesting camera roll permission';
     case 'reading-camera-roll':
-      return 'Reading most recent photo';
+      return 'Reading most recent photos';
     case 'uploading':
-      return 'Uploading photo';
+      return 'Uploading photos';
     case 'analyzing_faces':
       return 'Analyzing faces';
     case 'awaiting_face_pick':
@@ -529,26 +530,34 @@ export default function Index() {
         return;
       }
 
-      const latestAsset = result.assets[0];
-      setUploadCount({ total: 1, uploaded: 0 });
+      const assetsToUpload = result.assets.slice(0, MOST_RECENT_LIMIT);
+      setUploadCount({ total: assetsToUpload.length, uploaded: 0 });
 
-      const info = await MediaLibrary.getAssetInfoAsync(latestAsset);
-      const local = info.localUri ?? latestAsset.uri;
-      const uri = await preprocessAssetUri(local, latestAsset.width ?? 0, latestAsset.height ?? 0);
-      if (!uri) {
+      setStatus('uploading');
+      const form = new FormData();
+      form.append('user_name', CURRENT_USER_NAME);
+      let uploaded = 0;
+      for (let i = 0; i < assetsToUpload.length; i += 1) {
+        const asset = assetsToUpload[i];
+        const info = await MediaLibrary.getAssetInfoAsync(asset);
+        const local = info.localUri ?? asset.uri;
+        const uri = await preprocessAssetUri(local, asset.width ?? 0, asset.height ?? 0);
+        if (!uri) continue;
+
+        form.append('photos', {
+          uri,
+          name: `${asset.id || `latest-photo-${i + 1}`}.jpg`,
+          type: 'image/jpeg',
+        } as any);
+        uploaded += 1;
+        setUploadCount({ total: assetsToUpload.length, uploaded });
+      }
+
+      if (uploaded === 0) {
         setStatus('failed');
         setError('Could not access local image files for upload.');
         return;
       }
-      setUploadCount({ total: 1, uploaded: 1 });
-
-      setStatus('uploading');
-      const form = new FormData();
-      form.append('photos', {
-        uri,
-        name: `${latestAsset.id || 'latest-photo'}.jpg`,
-        type: 'image/jpeg',
-      } as any);
 
       const created = await fetchJson<{ job: JobDetail }>('/api/jobs', {
         method: 'POST',
@@ -1289,7 +1298,7 @@ export default function Index() {
         <View style={styles.avatarPill}>
           <Text style={[styles.avatarText, serifStyle()]}>AR</Text>
         </View>
-        <Text style={[styles.profileName, serifStyle()]}>arjun rawal</Text>
+        <Text style={[styles.profileName, serifStyle()]}>{CURRENT_USER_NAME}</Text>
         <Pressable style={styles.editProfileButton}>
           <Text style={styles.editProfileText}>Edit profile</Text>
         </Pressable>
@@ -1387,7 +1396,7 @@ export default function Index() {
           <View style={styles.termsCard}>
             <Text style={styles.termsTitle}>Sync camera roll</Text>
             <Text style={styles.termsBody}>
-              By continuing, phia will request iOS photo permission and only upload your most recent photo to
+              By continuing, phia will request iOS photo permission and upload your 3 most recent photos to
               extract clothing insights and personalize your shopping experience.
             </Text>
             <Text style={styles.termsFootnote}>You can revoke photo access any time in iOS Settings.</Text>

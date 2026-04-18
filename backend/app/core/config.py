@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
+    perplexity_api_key: str = ""
+    perplexity_model: str = "sonar"
 
     serpapi_key: str = ""
     replicate_api_token: str = ""
@@ -42,6 +44,10 @@ class Settings(BaseSettings):
     recent_limit: int = 50
     photo_concurrency: int = 10
     lookup_concurrency: int = 5
+    online_face_image_limit: int = 8
+    auto_face_pick_threshold: float = 0.75
+    auto_face_pick_margin: float = 0.12
+    auto_face_pick_alignment_floor: float = 0.5
 
 
 @lru_cache

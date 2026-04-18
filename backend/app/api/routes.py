@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from PIL import Image
 
 from app.core.config import get_settings
@@ -47,12 +47,28 @@ def get_job(job_id: str, request: Request) -> dict[str, object]:
 async def create_job(
     request: Request,
     photos: list[UploadFile] = File(...),
+    user_name: str | None = Form(None),
 ) -> dict[str, object]:
     if not photos:
         raise HTTPException(status_code=400, detail="No photos uploaded")
 
     settings = get_settings()
-    job_id = db.create_job(photo_count=len(photos))
+    expected_count = len(photos)
+    job_id = db.create_job(photo_count=0)
+    clean_user_name = (user_name or "").strip()
+    db.patch_job_debug(
+        job_id,
+        patch={
+            "upload": {
+                "expected_count": expected_count,
+                "saved_count": 0,
+                "started_at": db.utc_now_iso(),
+                "user_name": clean_user_name or None,
+            },
+            "stages": {"upload": "running"},
+        },
+        event={"type": "upload_started", "message": f"Upload started for {expected_count} photos"},
+    )
     saved_count = 0
 
     for upload in photos:
@@ -74,14 +90,35 @@ async def create_job(
                     height=height,
                 )
                 saved_count += 1
+                db.set_job_photo_count(job_id, saved_count)
+                db.patch_job_debug(
+                    job_id,
+                    patch={"upload": {"saved_count": saved_count}},
+                    event={
+                        "type": "photo_saved",
+                        "message": f"Saved photo {saved_count}/{expected_count}",
+                        "data": {"relative_path": rel_path, "width": width, "height": height},
+                    },
+                )
         except Exception:
             continue
 
     if saved_count == 0:
         db.update_job(job_id, status="failed", error="No valid image files found")
+        db.patch_job_debug(
+            job_id,
+            patch={"stages": {"upload": "failed"}},
+            event={"type": "upload_failed", "message": "No valid image files found"},
+        )
         raise HTTPException(status_code=400, detail="No valid image files found")
 
-    pipeline.start_face_analysis(job_id)
+    db.patch_job_debug(
+        job_id,
+        patch={"stages": {"upload": "complete"}, "upload": {"finished_at": db.utc_now_iso()}},
+        event={"type": "upload_complete", "message": f"Upload complete with {saved_count} photos"},
+    )
+
+    pipeline.start_face_analysis(job_id, user_name=clean_user_name if clean_user_name else None)
 
     detail = pipeline.build_job_detail(job_id, _media_base_url(request))
     if not detail:
@@ -110,6 +147,15 @@ def select_cluster(
         raise HTTPException(status_code=400, detail="Cluster does not belong to this job")
 
     pipeline.start_clothing_extraction(job_id, body.cluster_id)
+    db.patch_job_debug(
+        job_id,
+        patch={"stages": {"cluster_selection": "manual_selected"}},
+        event={
+            "type": "manual_cluster_selected",
+            "message": "User manually selected face cluster",
+            "data": {"cluster_id": body.cluster_id},
+        },
+    )
 
     detail = pipeline.build_job_detail(job_id, _media_base_url(request))
     if not detail:

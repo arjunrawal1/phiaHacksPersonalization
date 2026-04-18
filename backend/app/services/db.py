@@ -117,6 +117,13 @@ def init_db(db_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_clothing_items_job_id ON clothing_items(job_id);
             CREATE INDEX IF NOT EXISTS idx_clothing_items_photo_id ON clothing_items(photo_id);
+
+            CREATE TABLE IF NOT EXISTS job_debug (
+                job_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -168,6 +175,14 @@ def update_job(
         conn.execute(
             f"UPDATE jobs SET {', '.join(updates)} WHERE id = ?",
             values,
+        )
+
+
+def set_job_photo_count(job_id: str, photo_count: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET photo_count = ?, updated_at = ? WHERE id = ?",
+            (max(0, int(photo_count)), utc_now_iso(), job_id),
         )
 
 
@@ -345,6 +360,63 @@ def get_selected_cluster(job_id: str) -> dict[str, Any] | None:
             "SELECT * FROM selected_cluster WHERE job_id = ?", (job_id,)
         ).fetchone()
         return _row_to_dict(row) if row else None
+
+
+def _deep_merge(existing: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    out = dict(existing)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def patch_job_debug(
+    job_id: str,
+    *,
+    patch: dict[str, Any] | None = None,
+    event: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = utc_now_iso()
+    with _connect() as conn:
+        row = conn.execute("SELECT payload FROM job_debug WHERE job_id = ?", (job_id,)).fetchone()
+        payload = _json_or_default(row["payload"], {}) if row else {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if patch:
+            payload = _deep_merge(payload, patch)
+        if event:
+            events = payload.get("events")
+            if not isinstance(events, list):
+                events = []
+            events.append({"at": now, **event})
+            payload["events"] = events[-300:]
+
+        conn.execute(
+            """
+            INSERT INTO job_debug (job_id, payload, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              payload = excluded.payload,
+              updated_at = excluded.updated_at
+            """,
+            (job_id, json.dumps(payload), now),
+        )
+    return payload
+
+
+def get_job_debug(job_id: str) -> dict[str, Any]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT payload FROM job_debug WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return {}
+    parsed = _json_or_default(row["payload"], {})
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def clear_clothing_items(job_id: str) -> None:

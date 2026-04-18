@@ -57,6 +57,14 @@ class FaceClusterOut(BaseModel):
     source_url: str
 
 
+class FaceDetectionOut(BaseModel):
+    id: str
+    photo_id: str
+    cluster_id: str | None = None
+    bbox: BoundingBox
+    confidence: float
+
+
 class BestMatch(BaseModel):
     title: str
     source: str
@@ -91,8 +99,10 @@ class ClothingItemOut(BaseModel):
 class JobDetail(JobSummary):
     selected_cluster_id: str | None = None
     photos: list[PhotoOut] = Field(default_factory=list)
+    face_detections: list[FaceDetectionOut] = Field(default_factory=list)
     clusters: list[FaceClusterOut] = Field(default_factory=list)
     items: list[ClothingItemOut] = Field(default_factory=list)
+    debug: dict = Field(default_factory=dict)
 
 
 class CreateJobResponse(BaseModel):

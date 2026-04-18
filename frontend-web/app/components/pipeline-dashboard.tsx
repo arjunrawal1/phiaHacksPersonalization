@@ -11,34 +11,83 @@ type JobSummary = {
   updated_at: string;
 };
 
-type BestMatch = {
-  title: string;
-  source: string;
-  price: string | null;
-  link: string;
-  thumbnail: string;
-  confidence: number;
-  reasoning: string;
-  source_tier: "exact" | "similar";
+type PipelineEvent = {
+  at: string;
+  type: string;
+  message: string;
+  data?: Record<string, unknown>;
 };
 
-type JobItem = {
+type JobDebug = {
+  stages?: Record<string, string>;
+  upload?: {
+    expected_count?: number;
+    saved_count?: number;
+    started_at?: string;
+    finished_at?: string;
+    user_name?: string | null;
+  };
+  face_analysis?: {
+    started_at?: string;
+    user_name?: string | null;
+    total_clusters?: number;
+    total_detected_faces?: number;
+    inserted_cluster_count?: number;
+    cluster_member_counts?: number[];
+    faces_by_photo?: Record<string, number>;
+  };
+  serp_lookup?: {
+    query?: string;
+    candidate_count?: number;
+    candidate_urls?: string[];
+    downloaded_count?: number;
+    downloaded_urls?: string[];
+    filtered_face_count?: number;
+    filtered_face_urls?: string[];
+  };
+  auto_face_score?: {
+    state?: "running" | "complete";
+    mode?: string;
+    reason?: string | null;
+    auto_selected?: boolean;
+    selected_cluster_id?: string | null;
+    top_cluster_id?: string | null;
+    top_score?: number;
+    top_alignment?: number;
+    top_frequency?: number;
+    second_score?: number;
+    margin?: number;
+    top_matched_urls?: string[];
+    thresholds?: {
+      score?: number;
+      margin?: number;
+      alignment_floor?: number;
+    };
+    scored_clusters?: Array<{
+      cluster_id: string;
+      member_count?: number;
+      frequency: number;
+      alignment: number;
+      score: number;
+      matched_urls?: string[];
+    }>;
+  };
+  clothing_extraction?: {
+    cluster_id?: string;
+    started_at?: string;
+    finished_at?: string;
+    item_count?: number;
+    photo_count?: number;
+  };
+  events?: PipelineEvent[];
+};
+
+type FaceDetection = {
   id: string;
   photo_id: string;
-  category: string;
-  description: string;
-  colors: string[];
-  pattern: string;
-  style: string;
-  brand_visible: string | null;
-  visibility: string;
+  cluster_id: string | null;
+  bbox: { left: number; top: number; width: number; height: number };
   confidence: number;
-  crop_url: string | null;
-  tier: "exact" | "similar" | "generic" | "pending" | string;
-  exact_matches: Array<Record<string, unknown>>;
-  similar_products: Array<Record<string, unknown>>;
-  best_match: BestMatch | null;
-  best_match_confidence: number;
 };
 
 type JobDetail = JobSummary & {
@@ -49,28 +98,92 @@ type JobDetail = JobSummary & {
     width: number | null;
     height: number | null;
   }[];
+  face_detections: FaceDetection[];
   clusters: {
     id: string;
     rep_photo_id: string;
     rep_bbox: { left: number; top: number; width: number; height: number };
+    rep_aspect_ratio?: number;
     member_count: number;
     source_url: string;
   }[];
-  items: JobItem[];
+  debug?: JobDebug;
 };
 
 type Props = {
   backendUrl: string;
 };
 
-const POLL_MS = 1500;
+const POLL_MS = 1200;
+
+function isSerpProxyUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    return u.hostname.includes("serpapi.com") && u.pathname.includes("/searches/");
+  } catch {
+    return raw.includes("serpapi.com/searches/");
+  }
+}
+
+function imageKey(raw: string): string {
+  try {
+    const u = new URL(raw);
+    const normalizedPath = decodeURIComponent(u.pathname).replace(/\/+$/, "").toLowerCase();
+    return `${u.hostname.toLowerCase()}${normalizedPath}`;
+  } catch {
+    return raw.trim().toLowerCase();
+  }
+}
+
+function dedupeImageUrls(urls: string[]): string[] {
+  const nonProxy = urls.filter((u) => !isSerpProxyUrl(u));
+  const source = nonProxy.length > 0 ? nonProxy : urls;
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const u of source) {
+    const key = imageKey(u);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(u);
+  }
+  return out;
+}
+
+function getFaceCropStyle(
+  bb: { left: number; top: number; width: number; height: number },
+  aspectRatio: number,
+  size: number
+): React.CSSProperties {
+  const safeAspectRatio = aspectRatio > 0 ? aspectRatio : 1;
+  const visibleFraction = Math.max(bb.width, bb.height) * 1.8;
+  const scale = size / Math.max(visibleFraction, 0.0001);
+
+  const imgW = scale * (safeAspectRatio >= 1 ? 1 : safeAspectRatio);
+  const imgH = scale * (safeAspectRatio >= 1 ? 1 / safeAspectRatio : 1);
+
+  const centerX = bb.left + bb.width / 2;
+  const centerY = bb.top + bb.height / 2;
+
+  return {
+    position: "absolute",
+    width: imgW,
+    height: imgH,
+    left: size / 2 - centerX * imgW,
+    top: size / 2 - centerY * imgH,
+    maxWidth: "none",
+    maxHeight: "none",
+    objectFit: "fill",
+  };
+}
 
 export function PipelineDashboard({ backendUrl }: Props) {
   const [jobs, setJobs] = useState<JobSummary[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [detail, setDetail] = useState<JobDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [refreshingItemId, setRefreshingItemId] = useState<string | null>(null);
+  const [busySelectClusterId, setBusySelectClusterId] = useState<string | null>(null);
+  const [visibleSerpUrls, setVisibleSerpUrls] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -83,6 +196,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
       if (!targetId) {
         setDetail(null);
         setSelectedJobId(null);
+        setVisibleSerpUrls([]);
         return;
       }
       if (targetId !== selectedJobId) setSelectedJobId(targetId);
@@ -98,9 +212,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
   }, [backendUrl, selectedJobId]);
 
   useEffect(() => {
-    const kickoff = setTimeout(() => {
-      void load();
-    }, 0);
+    const kickoff = setTimeout(() => void load(), 0);
     const id = setInterval(() => void load(), POLL_MS);
     return () => {
       clearTimeout(kickoff);
@@ -108,213 +220,316 @@ export function PipelineDashboard({ backendUrl }: Props) {
     };
   }, [load]);
 
-  const grouped = useMemo(() => {
-    if (!detail) return [] as { photo: JobDetail["photos"][number]; items: JobItem[] }[];
-    const byPhoto = new Map<string, JobItem[]>();
-    for (const item of detail.items) {
-      const arr = byPhoto.get(item.photo_id) ?? [];
-      arr.push(item);
-      byPhoto.set(item.photo_id, arr);
+  const detectionsByPhoto = useMemo(() => {
+    const map = new Map<string, FaceDetection[]>();
+    for (const det of detail?.face_detections ?? []) {
+      const arr = map.get(det.photo_id) ?? [];
+      arr.push(det);
+      map.set(det.photo_id, arr);
     }
-    return detail.photos
-      .map((photo) => ({ photo, items: byPhoto.get(photo.id) ?? [] }))
-      .filter((section) => section.items.length > 0);
-  }, [detail]);
+    return map;
+  }, [detail?.face_detections]);
 
-  const counts = useMemo(() => {
-    if (!detail) return { exact: 0, similar: 0, pending: 0, generic: 0 };
-    return {
-      exact: detail.items.filter((i) => i.tier === "exact").length,
-      similar: detail.items.filter((i) => i.tier === "similar").length,
-      pending: detail.items.filter((i) => i.tier === "pending").length,
-      generic: detail.items.filter((i) => i.tier === "generic").length,
-    };
-  }, [detail]);
+  const clusterById = useMemo(() => {
+    const map = new Map<string, JobDetail["clusters"][number]>();
+    for (const c of detail?.clusters ?? []) map.set(c.id, c);
+    return map;
+  }, [detail?.clusters]);
 
-  async function refreshItem(itemId: string) {
-    if (refreshingItemId) return;
-    setRefreshingItemId(itemId);
-    try {
-      const res = await fetch(`${backendUrl}/api/items/${itemId}/refresh`, {
-        method: "POST",
+  const selectedCluster = detail?.selected_cluster_id ? clusterById.get(detail.selected_cluster_id) ?? null : null;
+  const selectedClusterPhoto = selectedCluster
+    ? detail?.photos.find((p) => p.id === selectedCluster.rep_photo_id) ?? null
+    : null;
+
+  const serpCandidates = useMemo(
+    () => dedupeImageUrls(detail?.debug?.serp_lookup?.candidate_urls ?? []),
+    [detail?.debug?.serp_lookup?.candidate_urls]
+  );
+  const personName = detail?.debug?.upload?.user_name ?? "user";
+  const autoFaceState = detail?.debug?.auto_face_score?.state;
+  const isAutoScoreRunning = autoFaceState === "running";
+  const topScore = detail?.debug?.auto_face_score?.top_score;
+  const shouldAskUserConfirm =
+    detail?.status === "awaiting_face_pick" ||
+    (!!detail &&
+      !selectedCluster &&
+      !isAutoScoreRunning &&
+      detail?.debug?.auto_face_score?.auto_selected !== true);
+  const selectedMatchedUrlKeySet = useMemo(() => {
+    const selectedId = selectedCluster?.id;
+    if (!selectedId) return new Set<string>();
+    const scored = detail?.debug?.auto_face_score?.scored_clusters ?? [];
+    const row = scored.find((r) => r.cluster_id === selectedId);
+    const urls = row?.matched_urls ?? [];
+    return new Set(urls.map((u) => imageKey(u)));
+  }, [detail?.debug?.auto_face_score?.scored_clusters, selectedCluster?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkUrl = (url: string): Promise<{ url: string; ok: boolean }> =>
+      new Promise((resolve) => {
+        const img = new Image();
+        let done = false;
+        const finish = (ok: boolean) => {
+          if (done) return;
+          done = true;
+          resolve({ url, ok });
+        };
+
+        const timer = setTimeout(() => finish(false), 7000);
+        img.onload = () => {
+          clearTimeout(timer);
+          finish(true);
+        };
+        img.onerror = () => {
+          clearTimeout(timer);
+          finish(false);
+        };
+        img.referrerPolicy = "no-referrer";
+        img.src = url;
       });
-      if (!res.ok) {
-        throw new Error(`Refresh HTTP ${res.status}`);
+
+    const run = async () => {
+      if (serpCandidates.length === 0) {
+        if (!cancelled) setVisibleSerpUrls([]);
+        return;
       }
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRefreshingItemId(null);
-    }
-  }
+      const checks = await Promise.all(serpCandidates.map((url) => checkUrl(url)));
+      if (cancelled) return;
+      setVisibleSerpUrls(checks.filter((c) => c.ok).map((c) => c.url));
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [serpCandidates]);
+
+  const chooseCluster = useCallback(
+    async (clusterId: string) => {
+      if (!detail) return;
+      setBusySelectClusterId(clusterId);
+      try {
+        const res = await fetch(`${backendUrl}/api/jobs/${detail.id}/select-cluster`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cluster_id: clusterId }),
+        });
+        if (!res.ok) throw new Error(`Select HTTP ${res.status}`);
+        const data = (await res.json()) as { job: JobDetail };
+        setDetail(data.job);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusySelectClusterId(null);
+      }
+    },
+    [backendUrl, detail]
+  );
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[320px_minmax(0,1fr)]">
-      <section className="rounded-xl border border-border bg-card p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Jobs</h2>
-          <span className="text-xs text-muted-foreground">{jobs.length}</span>
-        </div>
+    <div className="space-y-5">
+      <header className="rounded-xl border border-border bg-card px-5 py-4">
+        <h1 className="text-xl font-semibold tracking-tight">Phia Personalization (Behind the Scenes)</h1>
+      </header>
 
-        <div className="space-y-2">
-          {jobs.length === 0 ? (
-            <div className="rounded-md border border-border bg-muted px-3 py-4 text-sm text-muted-foreground">
-              No jobs yet. Start a mobile sync.
-            </div>
-          ) : (
-            jobs.map((job) => (
-              <button
-                key={job.id}
-                type="button"
-                onClick={() => setSelectedJobId(job.id)}
-                className={`w-full rounded-md border px-3 py-3 text-left transition-colors ${
-                  selectedJobId === job.id
-                    ? "border-accent bg-accent/10"
-                    : "border-border bg-card hover:bg-muted"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <span className="font-mono text-xs text-muted-foreground">{job.id.slice(0, 8)}</span>
-                  <span className="text-xs font-medium uppercase tracking-wide text-foreground">{job.status}</span>
-                </div>
-                <div className="mt-1 text-xs text-muted-foreground">{job.photo_count} photos</div>
-              </button>
-            ))
-          )}
+      <section className="rounded-xl border border-border bg-card p-4">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">Jobs</h2>
+        <div className="flex gap-3 overflow-x-auto pb-1">
+          {jobs.map((job) => (
+            <button
+              key={job.id}
+              type="button"
+              onClick={() => {
+                setSelectedJobId(job.id);
+              }}
+              className={`min-w-[220px] rounded-lg border px-3 py-2 text-left transition-colors ${
+                selectedJobId === job.id ? "border-accent bg-accent/10" : "border-border bg-muted hover:bg-card"
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-mono text-xs text-muted-foreground">{job.id.slice(0, 8)}</span>
+                <span className="text-[11px] font-semibold uppercase tracking-wide">{job.status}</span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">{job.photo_count} photos</div>
+            </button>
+          ))}
         </div>
       </section>
 
-      <section className="rounded-xl border border-border bg-card p-5">
-        {!detail ? (
-          <div className="text-sm text-muted-foreground">Waiting for pipeline data...</div>
-        ) : (
-          <>
-            <header className="flex flex-col gap-2">
-              <div className="flex flex-wrap items-center gap-3">
-                <h2 className="text-xl font-semibold tracking-tight">Job {detail.id.slice(0, 8)}</h2>
-                <span className="rounded-full border border-border bg-muted px-3 py-1 text-xs font-semibold uppercase tracking-wide">
-                  {detail.status}
-                </span>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                {detail.photo_count} photos • {grouped.length} outfit photos • {detail.items.length} items
-              </p>
-              <p className="text-sm text-muted-foreground">
-                {counts.exact} exact • {counts.similar} similar • {counts.pending} pending • {counts.generic} no-match
-              </p>
-              {detail.error ? <p className="text-sm text-destructive">{detail.error}</p> : null}
-              {error ? <p className="text-sm text-destructive">{error}</p> : null}
-            </header>
+      {!detail ? (
+        <section className="rounded-xl border border-border bg-card p-5 text-sm text-muted-foreground">
+          Waiting for selected job...
+        </section>
+      ) : (
+        <section className="space-y-5 rounded-xl border border-border bg-card p-5">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="text-lg font-semibold">Selected Job {detail.id.slice(0, 8)}</h2>
+            <span className="rounded-full border border-border bg-muted px-3 py-1 text-xs font-semibold uppercase tracking-wide">
+              {detail.status}
+            </span>
+            {detail.error ? <span className="text-sm text-destructive">{detail.error}</span> : null}
+            {error ? <span className="text-sm text-destructive">{error}</span> : null}
+          </div>
 
-            {detail.clusters.length > 0 ? (
-              <section className="mt-6">
-                <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                  Face Clusters
-                </h3>
-                <div className="flex flex-wrap gap-3">
-                  {detail.clusters.slice(0, 10).map((cluster) => (
-                    <div
-                      key={cluster.id}
-                      className={`w-28 overflow-hidden rounded-lg border ${
-                        detail.selected_cluster_id === cluster.id ? "border-accent" : "border-border"
-                      }`}
-                    >
-                      <img src={cluster.source_url} alt="face cluster" className="h-20 w-full object-cover" />
-                      <div className="p-2 text-xs">
-                        <div className="font-medium">{cluster.member_count} photos</div>
-                        {detail.selected_cluster_id === cluster.id ? <div className="text-accent">selected</div> : null}
+          <div className="grid gap-4 xl:grid-cols-3">
+            <section className="space-y-3 xl:col-span-1">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Uploaded Photos</h3>
+              <div className="space-y-3">
+                {detail.photos.map((photo) => {
+                  const detections = detectionsByPhoto.get(photo.id) ?? [];
+                  const aspect =
+                    (photo.width ?? 0) > 0 && (photo.height ?? 0) > 0
+                      ? (photo.width ?? 1) / (photo.height ?? 1)
+                      : 1;
+                  return (
+                    <div key={photo.id} className="rounded-lg border border-border bg-muted p-2">
+                      <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-3">
+                        <img src={photo.url} alt="uploaded" className="h-24 w-full rounded-md object-cover" />
+                        <div>
+                          <div className="mb-1 flex items-center justify-between">
+                            <span className="font-mono text-[11px] text-muted-foreground">{photo.id.slice(0, 6)}</span>
+                            <span className="text-xs font-semibold">{detections.length} faces</span>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {detections.map((det) => (
+                              <div
+                                key={det.id}
+                                className="relative h-12 w-12 overflow-hidden rounded-full border border-border bg-card"
+                              >
+                                <img src={photo.url} alt="face crop" style={getFaceCropStyle(det.bbox, aspect, 48)} />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  ))}
-                </div>
-              </section>
-            ) : null}
+                  );
+                })}
+              </div>
+            </section>
 
-            <section className="mt-6 space-y-5">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Labeled Photos</h3>
-              {grouped.length === 0 ? (
-                <div className="rounded-md border border-border bg-muted px-3 py-6 text-sm text-muted-foreground">
-                  No labeled items yet.
-                </div>
-              ) : (
-                grouped.map(({ photo, items }) => (
-                  <div key={photo.id} className="grid gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
-                    <img src={photo.url} alt="uploaded" className="h-52 w-full rounded-lg border border-border object-cover" />
-                    <div className="space-y-2">
-                      {items.map((item) => (
-                        <div key={item.id} className="rounded-lg border border-border bg-muted p-2">
-                          <div className="flex items-start gap-3">
-                            {item.crop_url ? (
-                              <img src={item.crop_url} alt="crop" className="h-16 w-16 rounded-md object-cover" />
-                            ) : (
-                              <div className="h-16 w-16 rounded-md bg-card" />
-                            )}
-                            <div className="min-w-0 flex-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className={`rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${
-                                  item.tier === "exact"
-                                    ? "bg-emerald-600 text-white"
-                                    : item.tier === "similar"
-                                    ? "bg-emerald-100 text-emerald-700"
-                                    : item.tier === "pending"
-                                    ? "bg-amber-100 text-amber-700"
-                                    : "bg-slate-200 text-slate-700"
-                                }`}>
-                                  {item.tier}
-                                </span>
-                                <span className="text-xs text-muted-foreground">{item.category}</span>
-                                {item.brand_visible ? <span className="text-xs font-semibold">{item.brand_visible}</span> : null}
-                                <button
-                                  type="button"
-                                  onClick={() => refreshItem(item.id)}
-                                  disabled={refreshingItemId !== null}
-                                  className="ml-auto rounded border border-border bg-card px-2 py-1 text-[11px] hover:bg-background disabled:opacity-50"
-                                >
-                                  {refreshingItemId === item.id ? "Refreshing..." : "Refresh"}
-                                </button>
-                              </div>
-
-                              <p className="mt-1 truncate text-sm font-semibold">{item.description}</p>
-                              <p className="text-xs text-muted-foreground">
-                                {Math.round(item.confidence * 100)}% extraction confidence
-                              </p>
-                            </div>
-                          </div>
-
-                          {item.best_match ? (
-                            <a
-                              href={item.best_match.link || "#"}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="mt-2 flex items-center gap-2 rounded-md border border-border bg-card p-2"
-                            >
-                              {item.best_match.thumbnail ? (
-                                <img src={item.best_match.thumbnail} alt="candidate" className="h-14 w-14 rounded object-cover" />
-                              ) : (
-                                <div className="h-14 w-14 rounded bg-muted" />
-                              )}
-                              <div className="min-w-0 flex-1">
-                                <p className="truncate text-xs font-semibold">{item.best_match.title}</p>
-                                <p className="text-[11px] text-muted-foreground">
-                                  {item.best_match.price ?? ""} {item.best_match.source ? `• ${item.best_match.source}` : ""}
-                                </p>
-                                <p className="text-[11px] text-muted-foreground">
-                                  match {Math.round((item.best_match_confidence || 0) * 100)}%
-                                </p>
-                              </div>
-                            </a>
-                          ) : null}
-                        </div>
-                      ))}
+            <section className="space-y-3 xl:col-span-1">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Aggregated Faces</h3>
+              <div className="grid grid-cols-3 gap-3 lg:grid-cols-4">
+                {detail.clusters.map((cluster) => (
+                  <button
+                    key={cluster.id}
+                    type="button"
+                    disabled={busySelectClusterId !== null}
+                    onClick={() => void chooseCluster(cluster.id)}
+                    className={`rounded-lg border bg-muted p-2 text-center transition-colors ${
+                      detail.selected_cluster_id === cluster.id ? "border-accent" : "border-border"
+                    }`}
+                  >
+                    <div className="relative mx-auto h-14 w-14 overflow-hidden rounded-full border border-border bg-card">
+                      <img
+                        src={cluster.source_url}
+                        alt="aggregated face"
+                        style={getFaceCropStyle(cluster.rep_bbox, cluster.rep_aspect_ratio ?? 1, 56)}
+                      />
                     </div>
+                    <div className="mt-1 text-xs font-semibold">{cluster.member_count}</div>
+                    <div className="text-[10px] text-muted-foreground">photos</div>
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section className="space-y-3 xl:col-span-1">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                {`Google Image Response For "${personName}"`}
+              </h3>
+              <div className="grid grid-cols-3 gap-2 lg:grid-cols-4">
+                {visibleSerpUrls.slice(0, 24).map((url, idx) => (
+                  <a
+                    key={`${idx}-${url}`}
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`overflow-hidden rounded-md border bg-muted ${
+                      selectedMatchedUrlKeySet.has(imageKey(url))
+                        ? "border-4 border-emerald-600"
+                        : "border-border"
+                    }`}
+                  >
+                    <img
+                      src={url}
+                      alt=""
+                      className="h-16 w-full object-cover"
+                      onError={() => setVisibleSerpUrls((prev) => prev.filter((u) => u !== url))}
+                    />
+                  </a>
+                ))}
+              </div>
+            </section>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_240px]">
+            <section className="rounded-lg border border-border bg-muted p-3">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                Ask User To Confirm Their Face
+              </h3>
+              <div className="mt-2 space-y-1 text-sm">
+                <p>
+                  Confidence score:{" "}
+                  {isAutoScoreRunning ? (
+                    <span className="font-semibold text-muted-foreground">Computing...</span>
+                  ) : (
+                    <span className="font-semibold">
+                      {typeof topScore === "number" ? `${Math.round(topScore * 100)}%` : "N/A"}
+                    </span>
+                  )}
+                </p>
+                <p>
+                  Ask user to confirm:{" "}
+                  {isAutoScoreRunning ? (
+                    <span className="font-semibold text-muted-foreground">Determining...</span>
+                  ) : (
+                    <span className={`font-semibold ${shouldAskUserConfirm ? "text-amber-700" : "text-emerald-700"}`}>
+                      {shouldAskUserConfirm ? "YES" : "NO"}
+                    </span>
+                  )}
+                </p>
+              </div>
+              {shouldAskUserConfirm ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Mobile app will prompt user to pick a face. Once selected, this view updates automatically.
+                </p>
+              ) : isAutoScoreRunning ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Comparing the highest-frequency face against online references...
+                </p>
+              ) : null}
+            </section>
+
+            <section className="rounded-lg border border-border bg-muted p-3 text-center">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Chosen Face</h3>
+              {selectedCluster ? (
+                <>
+                  <div className="relative mx-auto mt-2 h-20 w-20 overflow-hidden rounded-full border border-border bg-card">
+                    <img
+                      src={selectedCluster.source_url}
+                      alt="chosen face"
+                      style={getFaceCropStyle(selectedCluster.rep_bbox, selectedCluster.rep_aspect_ratio ?? 1, 80)}
+                    />
                   </div>
-                ))
+                  <div className="mt-2 text-sm font-semibold">{selectedCluster.member_count} photos</div>
+                  <div className="text-xs text-muted-foreground">cluster {selectedCluster.id.slice(0, 8)}</div>
+                  {selectedClusterPhoto ? (
+                    <div className="mt-1 text-[11px] text-muted-foreground">from photo {selectedClusterPhoto.id.slice(0, 6)}</div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="mt-3 rounded-md border border-dashed border-border bg-card px-3 py-4 text-sm text-muted-foreground">
+                  {shouldAskUserConfirm ? "Waiting on user response" : "No face chosen yet"}
+                </div>
               )}
             </section>
-          </>
-        )}
-      </section>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

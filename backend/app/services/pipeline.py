@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,15 @@ TAG = "[pipeline]"
 REK_CONFIDENCE_THRESHOLD = 90.0
 REK_SIMILARITY_THRESHOLD = 80.0
 RANK_MAX_CANDIDATES = 5
+AUTO_PICK_FREQUENCY_WEIGHT = 0.65
+AUTO_PICK_ALIGNMENT_WEIGHT = 0.35
+AUTO_PICK_FAST_FREQUENCY_THRESHOLD = 0.67
+AUTO_PICK_FAST_MARGIN_THRESHOLD = 0.25
+AUTO_PICK_MAX_REFERENCE_CHECKS = 3
+ONLINE_FACE_DETECT_CONFIDENCE_MIN = 85.0
+ONLINE_SEARCH_TIMEOUT_SECONDS = 20
+ONLINE_IMAGE_TIMEOUT_SECONDS = 8
+ONLINE_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 CATEGORY_QUERY_TERMS: dict[str, list[str]] = {
     "top": ["shirt", "top", "sweater", "t-shirt", "blouse"],
@@ -47,13 +58,46 @@ CATEGORY_QUERY_TERMS: dict[str, list[str]] = {
     "accessory": ["watch", "bracelet", "necklace", "tie", "sunglasses", "belt"],
 }
 
+YOLO_WORLD_CLASS_NAMES: list[str] = [
+    "shirt",
+    "polo shirt",
+    "t-shirt",
+    "top",
+    "blouse",
+    "sweater",
+    "hoodie",
+    "jacket",
+    "coat",
+    "dress",
+    "pants",
+    "trousers",
+    "chinos",
+    "jeans",
+    "shorts",
+    "skirt",
+    "shoes",
+    "sneakers",
+    "boots",
+    "hat",
+    "cap",
+    "bag",
+    "backpack",
+    "handbag",
+    "belt",
+    "watch",
+    "bracelet",
+    "necklace",
+    "tie",
+    "sunglasses",
+]
+
 _RUNNING_FACE_JOBS: set[str] = set()
 _RUNNING_CLOTHING_RUNS: set[str] = set()
 _RUNNING_LOOKUPS: set[str] = set()
 _RUN_LOCK = threading.Lock()
 _LOOKUP_SEMAPHORE: threading.Semaphore | None = None
 _SETTINGS: Settings | None = None
-_REPLICATE_VERSION: str | None = None
+_REPLICATE_YOLO_VERSION: str | None = None
 _REPLICATE_VERSION_LOCK = threading.Lock()
 
 
@@ -88,6 +132,13 @@ def _external_media_url(relative_path: str | None) -> str | None:
     return f"{base.rstrip('/')}/media/{safe}"
 
 
+def _debug_patch(job_id: str, patch: dict[str, Any] | None = None, event: dict[str, Any] | None = None) -> None:
+    try:
+        db.patch_job_debug(job_id, patch=patch, event=event)
+    except Exception:
+        pass
+
+
 def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
     job = db.get_job(job_id)
     if not job:
@@ -95,9 +146,11 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
 
     photos = db.list_photos(job_id)
     photo_by_id = {p["id"]: p for p in photos}
+    face_detections = db.list_face_detections_for_job(job_id)
     clusters = db.list_face_clusters(job_id)
     selected = db.get_selected_cluster(job_id)
     items = db.list_clothing_items(job_id)
+    debug = db.get_job_debug(job_id)
 
     photos_out = [
         {
@@ -107,6 +160,17 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
             "height": p["height"],
         }
         for p in photos
+    ]
+
+    detections_out = [
+        {
+            "id": d["id"],
+            "photo_id": d["photo_id"],
+            "cluster_id": d.get("cluster_id"),
+            "bbox": d["bbox"],
+            "confidence": d["confidence"],
+        }
+        for d in face_detections
     ]
 
     clusters_out = []
@@ -154,12 +218,14 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
         **job,
         "selected_cluster_id": selected["cluster_id"] if selected else None,
         "photos": photos_out,
+        "face_detections": detections_out,
         "clusters": clusters_out,
         "items": items_out,
+        "debug": debug,
     }
 
 
-def start_face_analysis(job_id: str) -> None:
+def start_face_analysis(job_id: str, *, user_name: str | None = None) -> None:
     with _RUN_LOCK:
         if job_id in _RUNNING_FACE_JOBS:
             return
@@ -167,7 +233,7 @@ def start_face_analysis(job_id: str) -> None:
 
     def runner() -> None:
         try:
-            _analyze_faces_worker(job_id)
+            _analyze_faces_worker(job_id, user_name=user_name)
         finally:
             with _RUN_LOCK:
                 _RUNNING_FACE_JOBS.discard(job_id)
@@ -213,25 +279,81 @@ def start_lookup_item(item_id: str) -> None:
     threading.Thread(target=runner, name=f"lookup-{item_id[:8]}", daemon=True).start()
 
 
-def _analyze_faces_worker(job_id: str) -> None:
+def _analyze_faces_worker(job_id: str, *, user_name: str | None = None) -> None:
+    online_pool: ThreadPoolExecutor | None = None
     try:
         print(TAG, "face analysis start", job_id)
         db.update_job(job_id, status="analyzing_faces", error=None)
+        _debug_patch(
+            job_id,
+            patch={
+                "stages": {"face_analysis": "running"},
+                "face_analysis": {
+                    "started_at": db.utc_now_iso(),
+                    "user_name": user_name,
+                    "inserted_cluster_count": 0,
+                },
+            },
+            event={"type": "face_analysis_started", "message": "Face analysis started"},
+        )
         db.clear_face_analysis(job_id)
 
         photos = db.list_photos(job_id)
         if not photos:
             db.update_job(job_id, status="failed", error="No photos uploaded")
+            _debug_patch(
+                job_id,
+                patch={"stages": {"face_analysis": "failed"}},
+                event={"type": "face_analysis_failed", "message": "No photos uploaded"},
+            )
             return
+
+        online_refs_future = None
+        if user_name:
+            online_pool = ThreadPoolExecutor(max_workers=1)
+            online_refs_future = online_pool.submit(_collect_online_face_refs, job_id, user_name)
 
         clusters = _analyze_faces_with_rekognition(job_id, photos)
         if clusters is None:
             clusters = _analyze_faces_local(job_id, photos)
 
         if not clusters:
+            if online_pool is not None:
+                online_pool.shutdown(wait=False, cancel_futures=True)
             db.update_job(job_id, status="failed", error="No faces detected above threshold")
+            _debug_patch(
+                job_id,
+                patch={"stages": {"face_analysis": "failed"}},
+                event={"type": "face_analysis_failed", "message": "No faces detected above threshold"},
+            )
             return
 
+        total_faces = sum(len(c["members"]) for c in clusters)
+        faces_by_photo: dict[str, int] = {}
+        for cluster in clusters:
+            for member in cluster["members"]:
+                pid = member.get("photo_id")
+                if pid:
+                    faces_by_photo[pid] = int(faces_by_photo.get(pid, 0)) + 1
+        _debug_patch(
+            job_id,
+            patch={
+                "face_analysis": {
+                    "total_clusters": len(clusters),
+                    "total_detected_faces": total_faces,
+                    "faces_by_photo": faces_by_photo,
+                    "cluster_member_counts": [
+                        len({m["photo_id"] for m in c["members"]}) for c in clusters
+                    ],
+                }
+            },
+            event={
+                "type": "face_detection_complete",
+                "message": f"Detected {total_faces} faces in {len(clusters)} clusters",
+            },
+        )
+
+        saved_clusters: list[dict[str, Any]] = []
         for cluster in clusters:
             member_photo_ids = {m["photo_id"] for m in cluster["members"]}
             rep = max(cluster["members"], key=lambda m: float(m["confidence"]))
@@ -242,17 +364,104 @@ def _analyze_faces_worker(job_id: str) -> None:
                 member_count=len(member_photo_ids),
             )
             db.set_detection_cluster([m["id"] for m in cluster["members"]], cluster_id)
+            saved_clusters.append(
+                {
+                    "id": cluster_id,
+                    "rep_photo_id": rep["photo_id"],
+                    "rep_bbox": rep["bbox"],
+                    "member_count": len(member_photo_ids),
+                }
+            )
+            _debug_patch(
+                job_id,
+                patch={
+                    "face_analysis": {
+                        "inserted_cluster_count": len(saved_clusters),
+                    }
+                },
+                event={
+                    "type": "cluster_inserted",
+                    "message": f"Inserted cluster {len(saved_clusters)}",
+                    "data": {
+                        "cluster_id": cluster_id,
+                        "member_count": len(member_photo_ids),
+                        "rep_photo_id": rep["photo_id"],
+                    },
+                },
+            )
 
-        db.update_job(job_id, status="awaiting_face_pick", error=None)
+        online_refs: list[dict[str, Any]] = []
+        if online_refs_future is not None:
+            try:
+                online_refs = online_refs_future.result(timeout=ONLINE_SEARCH_TIMEOUT_SECONDS)
+            except FutureTimeoutError:
+                online_refs_future.cancel()
+                online_refs = []
+            except Exception:
+                online_refs = []
+            finally:
+                if online_pool is not None:
+                    online_pool.shutdown(wait=False, cancel_futures=True)
+        elif online_pool is not None:
+            online_pool.shutdown(wait=False, cancel_futures=True)
+
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "running",
+                    "reason": None,
+                }
+            },
+            event={
+                "type": "auto_face_scoring_started",
+                "message": "Computing confidence score for automatic face selection",
+            },
+        )
+
+        auto_cluster_id = _choose_auto_face_cluster(
+            job_id=job_id,
+            photos=photos,
+            clusters=saved_clusters,
+            online_face_refs=online_refs,
+        )
+
+        if auto_cluster_id:
+            print(TAG, "auto-selected cluster", job_id, auto_cluster_id)
+            _debug_patch(
+                job_id,
+                patch={"stages": {"face_analysis": "complete", "cluster_selection": "auto_selected"}},
+                event={
+                    "type": "auto_cluster_selected",
+                    "message": "Auto-selected face cluster",
+                    "data": {"cluster_id": auto_cluster_id},
+                },
+            )
+            start_clothing_extraction(job_id, auto_cluster_id)
+        else:
+            db.update_job(job_id, status="awaiting_face_pick", error=None)
+            _debug_patch(
+                job_id,
+                patch={"stages": {"face_analysis": "complete", "cluster_selection": "awaiting_manual_pick"}},
+                event={
+                    "type": "awaiting_manual_cluster_pick",
+                    "message": "Awaiting user face selection",
+                },
+            )
+
         print(TAG, "face analysis done", job_id, "clusters", len(clusters))
     except Exception as exc:  # pragma: no cover
+        if online_pool is not None:
+            online_pool.shutdown(wait=False, cancel_futures=True)
         db.update_job(job_id, status="failed", error=f"Face analysis failed: {exc}")
+        _debug_patch(
+            job_id,
+            patch={"stages": {"face_analysis": "failed"}},
+            event={"type": "face_analysis_failed", "message": f"Face analysis failed: {exc}"},
+        )
 
 
-def _analyze_faces_with_rekognition(
-    job_id: str,
-    photos: list[dict[str, Any]],
-) -> list[dict[str, Any]] | None:
+def _get_rekognition_client() -> Any | None:
     settings = _settings()
     if not (
         boto3 is not None
@@ -261,15 +470,549 @@ def _analyze_faces_with_rekognition(
         and settings.aws_region
     ):
         return None
-
     try:
-        client = boto3.client(
+        return boto3.client(
             "rekognition",
             region_name=settings.aws_region,
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key,
         )
     except Exception:
+        return None
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    found = re.findall(r"https?://[^\s)\"'<>]+", text)
+    return [u.strip().rstrip(".,);]") for u in found]
+
+
+def _search_serpapi_image_urls(user_name: str) -> list[str]:
+    settings = _settings()
+    if not settings.serpapi_key:
+        return []
+
+    queries = [f'"{user_name}"']
+    raw_urls: list[str] = []
+    for query in queries:
+        try:
+            res = requests.get(
+                "https://serpapi.com/search.json",
+                params={
+                    "engine": "google_images",
+                    "q": query,
+                    "api_key": settings.serpapi_key,
+                    "num": max(10, settings.online_face_image_limit * 4),
+                    "safe": "off",
+                },
+                timeout=ONLINE_SEARCH_TIMEOUT_SECONDS,
+            )
+            if res.status_code >= 300:
+                continue
+            data = res.json()
+        except Exception:
+            continue
+
+        for item in data.get("images_results") or []:
+            # Prefer the source image URL and avoid Serp proxy thumbnails.
+            original = item.get("original")
+            thumbnail = item.get("thumbnail")
+            candidate = original if isinstance(original, str) and original.strip() else thumbnail
+            if not isinstance(candidate, str):
+                continue
+            if "serpapi.com/searches/" in candidate:
+                continue
+            raw_urls.append(candidate)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_urls:
+        cleaned = (raw or "").strip()
+        if not cleaned.startswith(("http://", "https://")):
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+        if len(deduped) >= max(1, settings.online_face_image_limit * 6):
+            break
+    print(TAG, "serpapi image candidates", user_name, "count", len(deduped))
+    return deduped
+
+
+def _search_online_image_urls(user_name: str) -> list[str]:
+    return _search_serpapi_image_urls(user_name)
+
+
+def _download_image_bytes(url: str) -> bytes | None:
+    try:
+        res = requests.get(url, timeout=ONLINE_IMAGE_TIMEOUT_SECONDS)
+    except Exception:
+        return None
+    if res.status_code >= 300:
+        return None
+    content_type = (res.headers.get("content-type") or "").lower()
+    if "image" not in content_type:
+        return None
+    body = res.content
+    if not body or len(body) > ONLINE_IMAGE_MAX_BYTES:
+        return None
+    return body
+
+
+def _collect_online_face_refs(job_id: str, user_name: str) -> list[dict[str, Any]]:
+    urls = _search_online_image_urls(user_name)
+    _debug_patch(
+        job_id,
+        patch={
+            "serp_lookup": {
+                "query": user_name,
+                "candidate_count": len(urls),
+                "candidate_urls": urls[:30],
+                "downloaded_count": 0,
+                "filtered_face_count": 0,
+                "filtered_face_urls": [],
+            }
+        },
+        event={
+            "type": "serp_lookup_complete",
+            "message": f"Serp returned {len(urls)} candidate image URLs",
+        },
+    )
+    if not urls:
+        return []
+
+    settings = _settings()
+    limit = max(1, settings.online_face_image_limit)
+    urls = urls[: max(limit * 2, limit)]
+
+    downloaded: list[tuple[str, bytes]] = []
+    for url in urls:
+        payload = _download_image_bytes(url)
+        if payload:
+            downloaded.append((url, payload))
+        if len(downloaded) >= limit:
+            break
+
+    if not downloaded:
+        _debug_patch(
+            job_id,
+            patch={"serp_lookup": {"downloaded_count": 0}},
+            event={
+                "type": "serp_download_empty",
+                "message": "No Serp candidate images were downloadable",
+            },
+        )
+        return []
+
+    client = _get_rekognition_client()
+    if client is None:
+        return []
+
+    _debug_patch(
+        job_id,
+        patch={
+            "serp_lookup": {
+                "downloaded_count": len(downloaded),
+                "downloaded_urls": [u for (u, _) in downloaded[:30]],
+            }
+        },
+        event={
+            "type": "serp_download_complete",
+            "message": f"Downloaded {len(downloaded)} candidate images",
+        },
+    )
+
+    filtered: list[tuple[str, bytes]] = []
+    for url, image_bytes in downloaded:
+        try:
+            detected = client.detect_faces(
+                Image={"Bytes": image_bytes},
+                Attributes=["DEFAULT"],
+            )
+        except Exception:
+            continue
+        faces = detected.get("FaceDetails") or []
+        if not faces:
+            continue
+        best = max(float(face.get("Confidence") or 0) for face in faces)
+        if best >= ONLINE_FACE_DETECT_CONFIDENCE_MIN:
+            filtered.append((url, image_bytes))
+        if len(filtered) >= limit:
+            break
+
+    _debug_patch(
+        job_id,
+        patch={
+            "serp_lookup": {
+                "filtered_face_count": len(filtered),
+                "filtered_face_urls": [u for (u, _) in filtered[:30]],
+            }
+        },
+        event={
+            "type": "serp_face_filter_complete",
+            "message": f"{len(filtered)} online references passed face detection",
+        },
+    )
+
+    return [{"url": u, "bytes": img} for (u, img) in filtered]
+
+
+def _crop_to_jpeg_bytes(
+    photo_path: Path,
+    bbox: dict[str, float],
+    *,
+    pad: float = 0.4,
+) -> bytes | None:
+    try:
+        with Image.open(photo_path).convert("RGB") as image:
+            width, height = image.size
+            left = float(bbox.get("left") or 0)
+            top = float(bbox.get("top") or 0)
+            box_w = float(bbox.get("width") or 0)
+            box_h = float(bbox.get("height") or 0)
+
+            x1 = max(0, int((left - box_w * pad) * width))
+            y1 = max(0, int((top - box_h * pad) * height))
+            x2 = min(width, int((left + box_w * (1 + pad)) * width))
+            y2 = min(height, int((top + box_h * (1 + pad)) * height))
+
+            if x2 <= x1 or y2 <= y1:
+                return None
+
+            crop = image.crop((x1, y1, x2, y2))
+            buf = io.BytesIO()
+            crop.save(buf, format="JPEG", quality=88)
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _choose_auto_face_cluster(
+    *,
+    job_id: str,
+    photos: list[dict[str, Any]],
+    clusters: list[dict[str, Any]],
+    online_face_refs: list[dict[str, Any]],
+) -> str | None:
+    if not clusters:
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "complete",
+                    "scored_clusters": [],
+                    "auto_selected": False,
+                    "reason": "No face clusters were available",
+                }
+            },
+            event={
+                "type": "auto_face_scoring_skipped",
+                "message": "Auto face scoring skipped because no clusters were available",
+            },
+        )
+        return None
+
+    settings = _settings()
+    total_photos = max(1, len(photos))
+    ranked_clusters = sorted(
+        clusters,
+        key=lambda c: (-int(c.get("member_count") or 0), str(c.get("id") or "")),
+    )
+    top_cluster = ranked_clusters[0]
+    top_cluster_id = str(top_cluster["id"])
+    top_frequency = min(1.0, max(0.0, float(top_cluster.get("member_count") or 0) / total_photos))
+    second_frequency = (
+        min(1.0, max(0.0, float(ranked_clusters[1].get("member_count") or 0) / total_photos))
+        if len(ranked_clusters) > 1
+        else 0.0
+    )
+    baseline_second_score = AUTO_PICK_FREQUENCY_WEIGHT * second_frequency
+
+    # Fast path: if one cluster clearly dominates frequency, auto-pick without expensive compare checks.
+    fast_frequency_margin = top_frequency - second_frequency
+    fast_path_passed = (
+        len(photos) >= 2
+        and top_frequency >= AUTO_PICK_FAST_FREQUENCY_THRESHOLD
+        and fast_frequency_margin >= AUTO_PICK_FAST_MARGIN_THRESHOLD
+    )
+    if fast_path_passed:
+        fast_score = top_frequency
+        fast_scored_clusters: list[dict[str, Any]] = [
+            {
+                "cluster_id": top_cluster_id,
+                "member_count": int(top_cluster.get("member_count") or 0),
+                "frequency": top_frequency,
+                "alignment": 0.0,
+                "score": fast_score,
+                "matched_urls": [],
+            }
+        ]
+        if len(ranked_clusters) > 1:
+            fast_scored_clusters.append(
+                {
+                    "cluster_id": str(ranked_clusters[1]["id"]),
+                    "member_count": int(ranked_clusters[1].get("member_count") or 0),
+                    "frequency": second_frequency,
+                    "alignment": 0.0,
+                    "score": second_frequency,
+                    "matched_urls": [],
+                }
+            )
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "complete",
+                    "mode": "frequency_fast_path",
+                    "weights": {
+                        "frequency": 1.0,
+                        "alignment": 0.0,
+                    },
+                    "thresholds": {
+                        "score": settings.auto_face_pick_threshold,
+                        "margin": settings.auto_face_pick_margin,
+                        "alignment_floor": settings.auto_face_pick_alignment_floor,
+                    },
+                    "total_uploaded_photos": total_photos,
+                    "online_reference_count": 0,
+                    "top_score": fast_score,
+                    "top_cluster_id": top_cluster_id,
+                    "top_alignment": 0.0,
+                    "top_frequency": top_frequency,
+                    "second_score": second_frequency,
+                    "margin": fast_frequency_margin,
+                    "top_matched_urls": [],
+                    "auto_selected": True,
+                    "selected_cluster_id": top_cluster_id,
+                    "reason": "Top frequency cluster dominated uploaded photos",
+                    "scored_clusters": fast_scored_clusters,
+                }
+            },
+            event={
+                "type": "auto_face_scored",
+                "message": "Auto face scoring complete (frequency fast path)",
+                "data": {
+                    "top_cluster_id": top_cluster_id,
+                    "top_score": fast_score,
+                    "margin": fast_frequency_margin,
+                    "selected": True,
+                },
+            },
+        )
+        return top_cluster_id
+
+    if not online_face_refs:
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "complete",
+                    "mode": "top_cluster_compare",
+                    "scored_clusters": [
+                        {
+                            "cluster_id": top_cluster_id,
+                            "member_count": int(top_cluster.get("member_count") or 0),
+                            "frequency": top_frequency,
+                            "alignment": 0.0,
+                            "score": AUTO_PICK_FREQUENCY_WEIGHT * top_frequency,
+                            "matched_urls": [],
+                        }
+                    ],
+                    "auto_selected": False,
+                    "reason": "No online face references were available for comparison",
+                }
+            },
+            event={
+                "type": "auto_face_scoring_skipped",
+                "message": "Auto face scoring could not compare due to missing online references",
+            },
+        )
+        return None
+
+    client = _get_rekognition_client()
+    if client is None:
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "complete",
+                    "scored_clusters": [],
+                    "auto_selected": False,
+                    "reason": "Rekognition client unavailable for compare step",
+                }
+            },
+            event={
+                "type": "auto_face_scoring_skipped",
+                "message": "Auto face scoring skipped because Rekognition client is unavailable",
+            },
+        )
+        return None
+
+    photo_by_id = {p["id"]: p for p in photos}
+    top_photo = photo_by_id.get(str(top_cluster["rep_photo_id"]))
+    if not top_photo:
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "complete",
+                    "scored_clusters": [],
+                    "auto_selected": False,
+                    "reason": "Top cluster representative photo was missing",
+                }
+            },
+            event={
+                "type": "auto_face_scoring_empty",
+                "message": "Top cluster representative photo missing; cannot compare",
+            },
+        )
+        return None
+
+    top_photo_path = settings.media_dir / top_photo["relative_path"]
+    source_bytes = _crop_to_jpeg_bytes(top_photo_path, top_cluster["rep_bbox"], pad=0.4)
+    if not source_bytes:
+        _debug_patch(
+            job_id,
+            patch={
+                "auto_face_score": {
+                    "state": "complete",
+                    "scored_clusters": [],
+                    "auto_selected": False,
+                    "reason": "Could not create source face crop for top cluster",
+                }
+            },
+            event={
+                "type": "auto_face_scoring_empty",
+                "message": "Could not crop top cluster face for comparison",
+            },
+        )
+        return None
+
+    refs_to_check = online_face_refs[: max(1, min(AUTO_PICK_MAX_REFERENCE_CHECKS, len(online_face_refs)))]
+    best_similarity = 0.0
+    matched_urls: set[str] = set()
+    for ref in refs_to_check:
+        target_bytes = ref.get("bytes")
+        target_url = str(ref.get("url") or "")
+        if not isinstance(target_bytes, (bytes, bytearray)):
+            continue
+        try:
+            compared = client.compare_faces(
+                SourceImage={"Bytes": source_bytes},
+                TargetImage={"Bytes": target_bytes},
+                SimilarityThreshold=REK_SIMILARITY_THRESHOLD,
+            )
+        except Exception:
+            continue
+        for match in compared.get("FaceMatches", []) or []:
+            similarity = float(match.get("Similarity") or 0)
+            if similarity > best_similarity:
+                best_similarity = similarity
+            if target_url:
+                matched_urls.add(target_url)
+
+    alignment = min(1.0, max(0.0, best_similarity / 100.0))
+    top_score = min(
+        1.0,
+        max(0.0, AUTO_PICK_FREQUENCY_WEIGHT * top_frequency + AUTO_PICK_ALIGNMENT_WEIGHT * alignment),
+    )
+    margin = top_score - baseline_second_score
+
+    scored: list[dict[str, Any]] = [
+        {
+            "cluster_id": top_cluster_id,
+            "member_count": int(top_cluster.get("member_count") or 0),
+            "frequency": top_frequency,
+            "alignment": alignment,
+            "score": top_score,
+            "matched_urls": sorted(matched_urls)[:30],
+        }
+    ]
+    if len(ranked_clusters) > 1:
+        scored.append(
+            {
+                "cluster_id": str(ranked_clusters[1]["id"]),
+                "member_count": int(ranked_clusters[1].get("member_count") or 0),
+                "frequency": second_frequency,
+                "alignment": 0.0,
+                "score": baseline_second_score,
+                "matched_urls": [],
+            }
+        )
+
+    print(
+        TAG,
+        "auto-face score top",
+        f"{float(top_score):.3f}",
+        "freq",
+        f"{float(top_frequency):.3f}",
+        "align",
+        f"{float(alignment):.3f}",
+        "margin",
+        f"{margin:.3f}",
+    )
+
+    passed = (
+        float(top_score) >= settings.auto_face_pick_threshold
+        and float(alignment) >= settings.auto_face_pick_alignment_floor
+        and margin >= settings.auto_face_pick_margin
+    )
+    selected_cluster_id = top_cluster_id if passed else None
+    _debug_patch(
+        job_id,
+        patch={
+            "auto_face_score": {
+                "state": "complete",
+                "mode": "top_cluster_compare",
+                "weights": {
+                    "frequency": AUTO_PICK_FREQUENCY_WEIGHT,
+                    "alignment": AUTO_PICK_ALIGNMENT_WEIGHT,
+                },
+                "thresholds": {
+                    "score": settings.auto_face_pick_threshold,
+                    "margin": settings.auto_face_pick_margin,
+                    "alignment_floor": settings.auto_face_pick_alignment_floor,
+                },
+                "total_uploaded_photos": total_photos,
+                "online_reference_count": len(refs_to_check),
+                "top_score": float(top_score),
+                "top_cluster_id": top_cluster_id,
+                "top_alignment": float(alignment),
+                "top_frequency": float(top_frequency),
+                "second_score": baseline_second_score,
+                "margin": margin,
+                "top_matched_urls": sorted(matched_urls)[:30],
+                "auto_selected": passed,
+                "selected_cluster_id": selected_cluster_id,
+                "reason": "Top frequency cluster compared against online references",
+                "scored_clusters": scored[:30],
+            }
+        },
+        event={
+            "type": "auto_face_scored",
+            "message": "Auto face scoring complete",
+            "data": {
+                "top_cluster_id": top_cluster_id,
+                "top_score": float(top_score),
+                "margin": margin,
+                "matched_url_count": len(matched_urls),
+                "selected": passed,
+            },
+        },
+    )
+    return selected_cluster_id
+
+
+def _analyze_faces_with_rekognition(
+    job_id: str,
+    photos: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    settings = _settings()
+    client = _get_rekognition_client()
+    if client is None:
         return None
 
     collection_id = f"phiahacks-{uuid.uuid4().hex[:8]}"
@@ -420,10 +1163,37 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
         db.upsert_selected_cluster(job_id, cluster_id)
         db.clear_clothing_items(job_id)
         db.update_job(job_id, status="extracting_clothing", error=None)
+        _debug_patch(
+            job_id,
+            patch={
+                "stages": {"clothing_extraction": "running"},
+                "clothing_extraction": {
+                    "cluster_id": cluster_id,
+                    "started_at": db.utc_now_iso(),
+                    "item_count": 0,
+                },
+            },
+            event={
+                "type": "clothing_extraction_started",
+                "message": "Started clothing extraction",
+                "data": {"cluster_id": cluster_id},
+            },
+        )
 
         detections = db.list_face_detections_for_cluster(cluster_id)
         if not detections:
             db.update_job(job_id, status="done", error=None)
+            _debug_patch(
+                job_id,
+                patch={
+                    "stages": {"clothing_extraction": "complete"},
+                    "clothing_extraction": {"item_count": 0, "photo_count": 0},
+                },
+                event={
+                    "type": "clothing_extraction_complete",
+                    "message": "No detections in selected cluster; extraction complete",
+                },
+            )
             return
 
         settings = _settings()
@@ -447,38 +1217,24 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
             face_tile_rel = _save_face_tile(photo_path, job_id, photo_id, face_bbox)
             face_tile_path = settings.media_dir / face_tile_rel
 
-            items = _extract_items_from_photo(photo_path, face_bbox, face_tile_path)
+            external_photo_url = _external_media_url(photo["relative_path"])
+            if not external_photo_url:
+                return []
+
+            # YOLO-World is the source of truth for regions; GPT only filters/selects among these boxes.
+            detections = _detect_objects(external_photo_url)
+            if not detections:
+                return []
+
+            items = _extract_items_from_detections(photo_path, face_bbox, face_tile_path, detections)
             visible = [
-                i for i in items if i.get("visibility", "clear") != "obscured" and float(i.get("confidence", 0)) >= 0.4
+                i for i in items if i.get("visibility", "clear") != "obscured" and float(i.get("confidence", 0)) >= 0.35
             ]
             if not visible:
                 return []
 
-            refined = visible
-            external_photo_url = _external_media_url(photo["relative_path"])
-            if photo.get("width") and photo.get("height") and external_photo_url:
-                dino = _detect_objects(external_photo_url, _build_grounding_query(visible))
-                if dino:
-                    used: set[int] = set()
-                    refined_next: list[dict[str, Any]] = []
-                    for item in visible:
-                        new_bbox = _find_refined_bbox(
-                            item,
-                            dino,
-                            used,
-                            int(photo["width"]),
-                            int(photo["height"]),
-                        )
-                        if new_bbox:
-                            merged = dict(item)
-                            merged["bounding_box"] = new_bbox
-                            refined_next.append(merged)
-                        else:
-                            refined_next.append(item)
-                    refined = refined_next
-
             inserted: list[str] = []
-            for item in refined:
+            for item in visible:
                 crop_rel = _save_item_crop(
                     photo_path=photo_path,
                     job_id=job_id,
@@ -519,12 +1275,35 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                     item_ids.extend(ids)
 
         db.update_job(job_id, status="done", error=None)
+        _debug_patch(
+            job_id,
+            patch={
+                "stages": {"clothing_extraction": "complete"},
+                "clothing_extraction": {
+                    "item_count": len(item_ids),
+                    "photo_count": len(entries),
+                    "finished_at": db.utc_now_iso(),
+                },
+            },
+            event={
+                "type": "clothing_extraction_complete",
+                "message": f"Clothing extraction complete with {len(item_ids)} items",
+            },
+        )
         for item_id in item_ids:
             start_lookup_item(item_id)
 
         print(TAG, "clothing extraction done", job_id, "items", len(item_ids))
     except Exception as exc:  # pragma: no cover
         db.update_job(job_id, status="failed", error=f"Clothing extraction failed: {exc}")
+        _debug_patch(
+            job_id,
+            patch={"stages": {"clothing_extraction": "failed"}},
+            event={
+                "type": "clothing_extraction_failed",
+                "message": f"Clothing extraction failed: {exc}",
+            },
+        )
 
 
 def _lookup_item_worker(item_id: str) -> None:
@@ -746,37 +1525,56 @@ def _cosine(a: Any, b: Any) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def _extract_items_from_photo(
+def _extract_items_from_detections(
     photo_path: Path,
     face_bbox: dict[str, float],
     face_tile_path: Path | None,
+    detections: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     settings = _settings()
     if settings.openai_api_key:
         try:
-            extracted = _extract_items_with_openai(photo_path, face_bbox, face_tile_path)
+            extracted = _extract_items_from_detections_with_openai(
+                photo_path=photo_path,
+                face_bbox=face_bbox,
+                face_tile_path=face_tile_path,
+                detections=detections,
+            )
             if extracted:
                 return extracted
         except Exception as exc:
-            print(TAG, "openai extraction failed", exc)
-    return _fallback_items(face_bbox)
+            print(TAG, "openai detection postprocess failed", exc)
+
+    with Image.open(photo_path).convert("RGB") as image:
+        img_w, img_h = image.size
+    return _fallback_items_from_detections(detections, img_w, img_h)
 
 
-def _extract_items_with_openai(
+def _extract_items_from_detections_with_openai(
+    *,
     photo_path: Path,
     face_bbox: dict[str, float],
     face_tile_path: Path | None,
+    detections: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     settings = _settings()
+    with Image.open(photo_path).convert("RGB") as image:
+        img_w, img_h = image.size
+
+    ranked = sorted(detections, key=lambda d: float(d.get("confidence") or 0), reverse=True)
+    candidates = [d for d in ranked if float(d.get("confidence") or 0) >= 0.08][:24]
+    if not candidates:
+        return []
 
     schema = {
         "type": "object",
         "properties": {
-            "items": {
+            "selected_items": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
+                        "detection_index": {"type": "integer"},
                         "category": {
                             "type": "string",
                             "enum": ["top", "bottom", "dress", "outerwear", "shoes", "hat", "bag", "accessory"],
@@ -786,36 +1584,27 @@ def _extract_items_with_openai(
                         "pattern": {"type": "string"},
                         "style": {"type": "string"},
                         "brand_visible": {"type": ["string", "null"]},
-                        "bounding_box": {
-                            "type": "object",
-                            "properties": {
-                                "x": {"type": "number"},
-                                "y": {"type": "number"},
-                                "w": {"type": "number"},
-                                "h": {"type": "number"},
-                            },
-                            "required": ["x", "y", "w", "h"],
-                            "additionalProperties": False,
-                        },
                         "visibility": {"type": "string", "enum": ["clear", "partial", "obscured"]},
                         "confidence": {"type": "number"},
+                        "crop_quality": {"type": "string", "enum": ["good", "bad"]},
                     },
                     "required": [
+                        "detection_index",
                         "category",
                         "description",
                         "colors",
                         "pattern",
                         "style",
                         "brand_visible",
-                        "bounding_box",
                         "visibility",
                         "confidence",
+                        "crop_quality",
                     ],
                     "additionalProperties": False,
                 },
             }
         },
-        "required": ["items"],
+        "required": ["selected_items"],
         "additionalProperties": False,
     }
 
@@ -824,26 +1613,46 @@ def _extract_items_with_openai(
         f"face at normalized coordinates (x={fbb['left']:.3f}, y={fbb['top']:.3f}, "
         f"width={fbb['width']:.3f}, height={fbb['height']:.3f})"
     )
+    detection_lines = []
+    for idx, det in enumerate(candidates):
+        x1, y1, x2, y2 = [int(float(v)) for v in det["bbox"]]
+        detection_lines.append(
+            f"{idx}: label={det.get('label','')}, score={float(det.get('confidence') or 0):.3f}, "
+            f"bbox=[{x1},{y1},{x2},{y2}]"
+        )
 
-    if face_tile_path and face_tile_path.exists():
-        instructions = (
-            "You are analyzing a photo to identify clothing items worn by a specific person. "
-            "IMAGE 1 is a close-up crop of the target person's face. IMAGE 2 is the full photo. "
-            f"Their {face_desc}; use that as a hint, but trust face matching from IMAGE 1. "
-            "Identify every visible clothing or accessory item worn by this person only. "
-            "Return short product-title-style descriptions."
-        )
-    else:
-        instructions = (
-            "You are analyzing a photo to identify clothing items worn by a specific person. "
-            f"The target person has a {face_desc}. "
-            "Identify visible clothing/accessories worn by this person only and return short product-title-style descriptions."
-        )
+    instructions = (
+        "You are post-processing YOLO-World detections for one target person.\n"
+        "Important rules:\n"
+        "1) Only choose detections worn by the target person from the face crop.\n"
+        "2) Do NOT invent, redraw, or move bounding boxes. You may only choose from listed detection indices.\n"
+        "3) Exclude detections on other people or background objects (even if clothing-looking).\n"
+        "4) For accessories, especially bracelets/wristbands: if crop is tiny, blurry, or not visually recognizable, set crop_quality='bad' so it is removed.\n"
+        "5) Keep only useful crops for downstream shopping lookup.\n"
+        f"Target hint: {face_desc}\n"
+        "Detections (in order):\n"
+        + "\n".join(detection_lines)
+    )
 
     content: list[dict[str, Any]] = [{"type": "input_text", "text": instructions}]
     if face_tile_path and face_tile_path.exists():
         content.append({"type": "input_image", "image_url": _data_url_for_image(face_tile_path), "detail": "high"})
     content.append({"type": "input_image", "image_url": _data_url_for_image(photo_path), "detail": "high"})
+
+    # Attach one crop per detection in the same order as the index list above.
+    for idx, det in enumerate(candidates):
+        content.append(
+            {
+                "type": "input_text",
+                "text": (
+                    f"Detection crop #{idx} (label={det.get('label','')}, "
+                    f"score={float(det.get('confidence') or 0):.3f})."
+                ),
+            }
+        )
+        crop_url = _crop_data_url_for_detection(photo_path, det["bbox"], pad=0.15)
+        if crop_url:
+            content.append({"type": "input_image", "image_url": crop_url, "detail": "high"})
 
     payload = {
         "model": settings.openai_model,
@@ -852,7 +1661,7 @@ def _extract_items_with_openai(
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "outfit_analysis",
+                "name": "yolo_postprocess",
                 "schema": schema,
                 "strict": True,
             }
@@ -866,7 +1675,7 @@ def _extract_items_with_openai(
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=90,
+        timeout=120,
     )
     response.raise_for_status()
     data = response.json()
@@ -880,88 +1689,151 @@ def _extract_items_with_openai(
                     break
             if raw:
                 break
-
     if not raw:
         return []
 
     parsed = json.loads(raw)
-    items = parsed.get("items", [])
+    selected = parsed.get("selected_items", []) or []
     normalized: list[dict[str, Any]] = []
-    for item in items:
-        box = item.get("bounding_box") or {}
+    used_indices: set[int] = set()
+    for item in selected:
+        try:
+            det_idx = int(item.get("detection_index"))
+        except Exception:
+            continue
+        if det_idx < 0 or det_idx >= len(candidates) or det_idx in used_indices:
+            continue
+        if item.get("crop_quality") == "bad":
+            continue
+
+        det = candidates[det_idx]
+        bbox = _detection_bbox_to_xywh(det["bbox"], img_w, img_h)
+        category = str(item.get("category") or _category_from_detector_label(str(det.get("label") or "")))
+        if category not in CATEGORY_QUERY_TERMS:
+            category = _category_from_detector_label(str(det.get("label") or ""))
+
+        visibility = str(item.get("visibility") or "clear")
+        confidence = float(item.get("confidence") or det.get("confidence") or 0)
+        confidence = max(0.0, min(1.0, confidence))
+
         normalized.append(
             {
-                "category": item.get("category", "top"),
-                "description": item.get("description", "Unlabeled clothing item"),
-                "colors": item.get("colors", []),
-                "pattern": item.get("pattern", ""),
-                "style": item.get("style", ""),
+                "category": category,
+                "description": item.get("description") or f"Detected {det.get('label') or 'clothing item'}",
+                "colors": item.get("colors") or ["unknown"],
+                "pattern": item.get("pattern") or "unknown",
+                "style": item.get("style") or "casual",
                 "brand_visible": item.get("brand_visible"),
-                "bounding_box": {
-                    "x": float(max(0, min(1, box.get("x", 0)))),
-                    "y": float(max(0, min(1, box.get("y", 0)))),
-                    "w": float(max(0.05, min(1, box.get("w", 0.2)))),
-                    "h": float(max(0.05, min(1, box.get("h", 0.2)))),
-                },
-                "visibility": item.get("visibility", "clear"),
-                "confidence": float(item.get("confidence", 0.5)),
+                "bounding_box": bbox,
+                "visibility": visibility if visibility in {"clear", "partial", "obscured"} else "clear",
+                "confidence": confidence,
             }
         )
+        used_indices.add(det_idx)
+
     return normalized
 
 
-def _fallback_items(face_bbox: dict[str, float]) -> list[dict[str, Any]]:
-    top_x = max(0.02, face_bbox["left"] - face_bbox["width"] * 0.2)
-    top_y = min(0.9, face_bbox["top"] + face_bbox["height"] * 0.8)
-    top_w = min(0.96 - top_x, face_bbox["width"] * 1.5)
-    top_h = min(0.95 - top_y, face_bbox["height"] * 1.6)
-
-    bottom_x = max(0.02, face_bbox["left"] - face_bbox["width"] * 0.15)
-    bottom_y = min(0.94, top_y + top_h * 0.9)
-    bottom_w = min(0.96 - bottom_x, face_bbox["width"] * 1.4)
-    bottom_h = min(0.95 - bottom_y, face_bbox["height"] * 1.3)
-
-    return [
-        {
-            "category": "top",
-            "description": "Detected upper-body clothing",
-            "colors": ["unknown"],
-            "pattern": "unknown",
-            "style": "casual",
-            "brand_visible": None,
-            "bounding_box": {"x": top_x, "y": top_y, "w": top_w, "h": top_h},
-            "visibility": "partial",
-            "confidence": 0.45,
-        },
-        {
-            "category": "bottom",
-            "description": "Detected lower-body clothing",
-            "colors": ["unknown"],
-            "pattern": "unknown",
-            "style": "casual",
-            "brand_visible": None,
-            "bounding_box": {"x": bottom_x, "y": bottom_y, "w": bottom_w, "h": bottom_h},
-            "visibility": "partial",
-            "confidence": 0.4,
-        },
-    ]
+def _detection_bbox_to_xywh(bbox: list[float], img_w: int, img_h: int) -> dict[str, float]:
+    x1 = max(0.0, min(float(img_w), float(bbox[0])))
+    y1 = max(0.0, min(float(img_h), float(bbox[1])))
+    x2 = max(x1 + 1.0, min(float(img_w), float(bbox[2])))
+    y2 = max(y1 + 1.0, min(float(img_h), float(bbox[3])))
+    return {
+        "x": max(0.0, min(1.0, x1 / img_w)),
+        "y": max(0.0, min(1.0, y1 / img_h)),
+        "w": max(0.01, min(1.0, (x2 - x1) / img_w)),
+        "h": max(0.01, min(1.0, (y2 - y1) / img_h)),
+    }
 
 
-def _build_grounding_query(items: list[dict[str, Any]]) -> str:
-    terms: set[str] = set()
-    for item in items:
-        for t in CATEGORY_QUERY_TERMS.get(str(item.get("category")), []):
-            terms.add(t)
-    return ", ".join(sorted(terms))
+def _category_from_detector_label(label: str) -> str:
+    text = label.lower()
+    if any(k in text for k in ("dress", "gown")):
+        return "dress"
+    if any(k in text for k in ("pants", "trouser", "chino", "jean", "short", "skirt")):
+        return "bottom"
+    if any(k in text for k in ("jacket", "coat", "hoodie", "blazer", "outerwear")):
+        return "outerwear"
+    if any(k in text for k in ("shoe", "sneaker", "boot", "loafer", "heel", "sandal")):
+        return "shoes"
+    if any(k in text for k in ("hat", "cap", "beanie")):
+        return "hat"
+    if any(k in text for k in ("bag", "backpack", "purse", "handbag")):
+        return "bag"
+    if any(k in text for k in ("watch", "bracelet", "necklace", "tie", "sunglasses", "belt", "ring")):
+        return "accessory"
+    return "top"
 
 
-def _detect_objects(image_url: str, query: str) -> list[dict[str, Any]]:
+def _crop_data_url_for_detection(photo_path: Path, bbox_xyxy: list[float], pad: float = 0.1) -> str | None:
+    try:
+        with Image.open(photo_path).convert("RGB") as image:
+            width, height = image.size
+            x1 = max(0, int(float(bbox_xyxy[0])))
+            y1 = max(0, int(float(bbox_xyxy[1])))
+            x2 = min(width, int(float(bbox_xyxy[2])))
+            y2 = min(height, int(float(bbox_xyxy[3])))
+            if x2 <= x1 or y2 <= y1:
+                return None
+
+            pad_x = int((x2 - x1) * pad)
+            pad_y = int((y2 - y1) * pad)
+            cx1 = max(0, x1 - pad_x)
+            cy1 = max(0, y1 - pad_y)
+            cx2 = min(width, x2 + pad_x)
+            cy2 = min(height, y2 + pad_y)
+            crop = image.crop((cx1, cy1, cx2, cy2))
+
+            buf = io.BytesIO()
+            crop.save(buf, format="JPEG", quality=90)
+            encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        return None
+
+
+def _fallback_items_from_detections(
+    detections: list[dict[str, Any]],
+    img_w: int,
+    img_h: int,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen_major: set[str] = set()
+    for det in sorted(detections, key=lambda d: float(d.get("confidence") or 0), reverse=True):
+        conf = float(det.get("confidence") or 0)
+        if conf < 0.18:
+            continue
+        category = _category_from_detector_label(str(det.get("label") or ""))
+        if category in seen_major and category not in {"accessory"}:
+            continue
+        out.append(
+            {
+                "category": category,
+                "description": f"Detected {det.get('label') or category}",
+                "colors": ["unknown"],
+                "pattern": "unknown",
+                "style": "casual",
+                "brand_visible": None,
+                "bounding_box": _detection_bbox_to_xywh(det["bbox"], img_w, img_h),
+                "visibility": "partial",
+                "confidence": min(0.95, conf),
+            }
+        )
+        if category != "accessory":
+            seen_major.add(category)
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _detect_objects(image_url: str) -> list[dict[str, Any]]:
     settings = _settings()
     if not settings.replicate_api_token or not image_url:
         return []
 
     try:
-        version = _replicate_grounding_dino_version(settings.replicate_api_token)
+        version = _replicate_yolo_world_version(settings.replicate_api_token)
         if not version:
             return []
 
@@ -979,11 +1851,12 @@ def _detect_objects(image_url: str, query: str) -> list[dict[str, Any]]:
                 json={
                     "version": version,
                     "input": {
-                        "image": image_url,
-                        "query": query,
-                        "box_threshold": 0.25,
-                        "text_threshold": 0.2,
-                        "show_visualisation": False,
+                        "input_media": image_url,
+                        "class_names": ",".join(YOLO_WORLD_CLASS_NAMES),
+                        "max_num_boxes": 120,
+                        "nms_thr": 0.6,
+                        "score_thr": 0.1,
+                        "return_json": True,
                     },
                 },
                 timeout=40,
@@ -1017,36 +1890,62 @@ def _detect_objects(image_url: str, query: str) -> list[dict[str, Any]]:
 
         if data.get("status") != "succeeded":
             return []
-        dets = (data.get("output") or {}).get("detections") or []
+
+        dets: list[dict[str, Any]] = []
+        output = data.get("output")
+        if isinstance(output, dict):
+            raw_json = output.get("json_str")
+            if isinstance(raw_json, str) and raw_json.strip():
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, dict):
+                    for value in parsed.values():
+                        if isinstance(value, dict):
+                            dets.append(value)
+                elif isinstance(parsed, list):
+                    for value in parsed:
+                        if isinstance(value, dict):
+                            dets.append(value)
+            elif isinstance(output.get("detections"), list):
+                # Compatibility with detectors that emit detections directly
+                dets = output.get("detections") or []
+
         out: list[dict[str, Any]] = []
         for det in dets:
-            bbox = det.get("bbox") or []
-            if len(bbox) != 4:
+            bbox: list[float] | None = None
+            if isinstance(det.get("bbox"), list) and len(det.get("bbox") or []) == 4:
+                raw_bbox = det.get("bbox") or []
+                bbox = [float(raw_bbox[0]), float(raw_bbox[1]), float(raw_bbox[2]), float(raw_bbox[3])]
+            elif all(k in det for k in ("x0", "y0", "x1", "y1")):
+                bbox = [float(det["x0"]), float(det["y0"]), float(det["x1"]), float(det["y1"])]
+
+            if not bbox:
                 continue
-            out.append(
-                {
-                    "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-                    "label": str(det.get("label") or ""),
-                    "confidence": float(det.get("confidence") or 0),
-                }
-            )
+
+            label = str(det.get("label") or det.get("cls") or "").strip().lower()
+            confidence = float(det.get("confidence") or det.get("score") or 0)
+            if not label:
+                continue
+
+            out.append({"bbox": bbox, "label": label, "confidence": confidence})
+
+        out.sort(key=lambda d: float(d.get("confidence") or 0), reverse=True)
         return out
     except Exception:
         return []
 
 
-def _replicate_grounding_dino_version(token: str) -> str | None:
-    global _REPLICATE_VERSION
-    if _REPLICATE_VERSION:
-        return _REPLICATE_VERSION
+def _replicate_yolo_world_version(token: str) -> str | None:
+    global _REPLICATE_YOLO_VERSION
+    if _REPLICATE_YOLO_VERSION:
+        return _REPLICATE_YOLO_VERSION
 
     with _REPLICATE_VERSION_LOCK:
-        if _REPLICATE_VERSION:
-            return _REPLICATE_VERSION
+        if _REPLICATE_YOLO_VERSION:
+            return _REPLICATE_YOLO_VERSION
 
         try:
             res = requests.get(
-                "https://api.replicate.com/v1/models/adirik/grounding-dino",
+                "https://api.replicate.com/v1/models/franz-biz/yolo-world-xl",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=20,
             )
@@ -1056,79 +1955,10 @@ def _replicate_grounding_dino_version(token: str) -> str | None:
             version = ((data.get("latest_version") or {}).get("id") or "").strip()
             if not version:
                 return None
-            _REPLICATE_VERSION = version
+            _REPLICATE_YOLO_VERSION = version
             return version
         except Exception:
             return None
-
-
-def _iou(a: list[float], b: list[float]) -> float:
-    x1 = max(a[0], b[0])
-    y1 = max(a[1], b[1])
-    x2 = min(a[2], b[2])
-    y2 = min(a[3], b[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    if inter == 0:
-        return 0
-    a_area = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    b_area = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-    denom = a_area + b_area - inter
-    return inter / denom if denom > 0 else 0
-
-
-def _find_refined_bbox(
-    item: dict[str, Any],
-    detections: list[dict[str, Any]],
-    used_indices: set[int],
-    img_w: int,
-    img_h: int,
-) -> dict[str, float] | None:
-    category = str(item.get("category"))
-    terms = [t.lower() for t in CATEGORY_QUERY_TERMS.get(category, [])]
-    if not terms:
-        return None
-
-    candidates: list[tuple[int, dict[str, Any]]] = []
-    for idx, det in enumerate(detections):
-        if idx in used_indices:
-            continue
-        label = str(det.get("label") or "").lower()
-        if any(t in label or label in t for t in terms):
-            candidates.append((idx, det))
-
-    if not candidates:
-        return None
-
-    box = item.get("bounding_box") or {}
-    gpt_box = [
-        float(box.get("x", 0)) * img_w,
-        float(box.get("y", 0)) * img_h,
-        float(box.get("x", 0) + box.get("w", 0.2)) * img_w,
-        float(box.get("y", 0) + box.get("h", 0.2)) * img_h,
-    ]
-
-    best_idx: int | None = None
-    best_det: dict[str, Any] | None = None
-    best_score = -1.0
-    for idx, det in candidates:
-        det_box = det["bbox"]
-        score = _iou(det_box, gpt_box) + float(det.get("confidence") or 0) * 0.1
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-            best_det = det
-
-    if best_idx is None or best_det is None or best_score < 0.1:
-        return None
-
-    used_indices.add(best_idx)
-    x1, y1, x2, y2 = best_det["bbox"]
-    return {
-        "x": max(0.0, min(1.0, x1 / img_w)),
-        "y": max(0.0, min(1.0, y1 / img_h)),
-        "w": max(0.01, min(1.0, (x2 - x1) / img_w)),
-        "h": max(0.01, min(1.0, (y2 - y1) / img_h)),
-    }
 
 
 def _find_exact_match(public_image_url: str, description: str) -> list[dict[str, Any]]:
