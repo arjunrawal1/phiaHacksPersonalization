@@ -543,10 +543,10 @@ export function PipelineDashboard({ backendUrl }: Props) {
   );
 
   return (
-    <div className="space-y-5">
-      <section className="rounded-xl border border-border bg-card p-4">
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">Jobs</h2>
-        <div className="flex gap-3 overflow-x-auto pb-1">
+    <div className="phia-dashboard space-y-6">
+      <section className="phia-panel p-5">
+        <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Jobs</h2>
+        <div className="phia-scroll flex gap-3 overflow-x-auto pb-1">
           {jobs.map((job) => (
             <button
               key={job.id}
@@ -554,8 +554,10 @@ export function PipelineDashboard({ backendUrl }: Props) {
               onClick={() => {
                 setSelectedJobId(job.id);
               }}
-              className={`min-w-[220px] rounded-lg border px-3 py-2 text-left transition-colors ${
-                selectedJobId === job.id ? "border-accent bg-accent/10" : "border-border bg-muted hover:bg-card"
+              className={`phia-soft-button min-w-[220px] rounded-2xl border px-3 py-2 text-left transition-colors ${
+                selectedJobId === job.id
+                  ? "border-accent bg-accent/14 shadow-[0_14px_24px_-20px_rgba(47,99,216,0.9)]"
+                  : "border-border bg-white/75 hover:bg-white"
               }`}
             >
               <div className="flex items-center justify-between">
@@ -569,14 +571,14 @@ export function PipelineDashboard({ backendUrl }: Props) {
       </section>
 
       {!detail ? (
-        <section className="rounded-xl border border-border bg-card p-5 text-sm text-muted-foreground">
+        <section className="phia-panel p-5 text-sm text-muted-foreground">
           Waiting for selected job...
         </section>
       ) : (
-        <section className="space-y-5 rounded-xl border border-border bg-card p-5">
+        <section className="phia-panel space-y-6 p-5">
           <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-lg font-semibold">Selected Job {detail.id.slice(0, 8)}</h2>
-            <span className="rounded-full border border-border bg-muted px-3 py-1 text-xs font-semibold uppercase tracking-wide">
+            <h2 className="text-xl font-semibold tracking-[-0.02em]">Selected Job {detail.id.slice(0, 8)}</h2>
+            <span className="phia-chip px-3 py-1 text-xs font-semibold uppercase tracking-[0.13em]">
               {detail.status}
             </span>
             {detail.error ? <span className="text-sm text-destructive">{detail.error}</span> : null}
@@ -584,9 +586,9 @@ export function PipelineDashboard({ backendUrl }: Props) {
           </div>
 
           <div className="grid gap-4 xl:grid-cols-3">
-            <section className="space-y-3 xl:col-span-1">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Uploaded Photos</h3>
-              <div className="h-[520px] space-y-3 overflow-y-auto pr-1">
+            <section className="phia-subpanel space-y-3 p-4 xl:col-span-1">
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Uploaded Photos</h3>
+              <div className="phia-scroll h-[520px] space-y-3 overflow-y-auto pr-1">
                 {detail.photos.map((photo) => {
                   const detections = detectionsByPhoto.get(photo.id) ?? [];
                   const aspect =
@@ -594,9 +596,9 @@ export function PipelineDashboard({ backendUrl }: Props) {
                       ? (photo.width ?? 1) / (photo.height ?? 1)
                       : 1;
                   return (
-                    <div key={photo.id} className="rounded-lg border border-border bg-muted p-2">
+                    <div key={photo.id} className="rounded-2xl border border-border bg-white/80 p-2.5">
                       <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-3">
-                        <img src={photo.url} alt="uploaded" className="h-20 w-full rounded-md object-cover" />
+                        <img src={photo.url} alt="uploaded" className="h-20 w-full rounded-xl object-cover shadow-sm" />
                         <div>
                           <div className="mb-1 flex items-center justify-between">
                             <span className="font-mono text-[11px] text-muted-foreground">{photo.id.slice(0, 6)}</span>
@@ -606,7 +608,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
                             {detections.map((det) => (
                               <div
                                 key={det.id}
-                                className="relative h-10 w-10 overflow-hidden rounded-full border border-border bg-card"
+                                className="relative h-10 w-10 overflow-hidden rounded-full border border-border bg-card shadow-sm"
                               >
                                 <img src={photo.url} alt="face crop" style={getFaceCropStyle(det.bbox, aspect, 40)} />
                               </div>
@@ -620,9 +622,9 @@ export function PipelineDashboard({ backendUrl }: Props) {
               </div>
             </section>
 
-            <section className="space-y-3 xl:col-span-1">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Aggregated Faces</h3>
-              <div className="h-[520px] overflow-y-auto pr-1">
+            <section className="phia-subpanel space-y-3 p-4 xl:col-span-1">
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Aggregated Faces</h3>
+              <div className="phia-scroll h-[520px] overflow-y-auto pr-1">
                 <div className="grid grid-cols-3 gap-3 lg:grid-cols-4">
                 {detail.clusters.map((cluster) => (
                   <button
@@ -630,11 +632,11 @@ export function PipelineDashboard({ backendUrl }: Props) {
                     type="button"
                     disabled={busySelectClusterId !== null}
                     onClick={() => void chooseCluster(cluster.id)}
-                    className={`rounded-lg border bg-muted p-2 text-center transition-colors ${
-                      detail.selected_cluster_id === cluster.id ? "border-accent" : "border-border"
+                    className={`phia-soft-button rounded-2xl border bg-white/80 p-2 text-center transition-colors ${
+                      detail.selected_cluster_id === cluster.id ? "border-accent bg-accent/12" : "border-border"
                     }`}
                   >
-                    <div className="relative mx-auto h-12 w-12 overflow-hidden rounded-full border border-border bg-card">
+                    <div className="relative mx-auto h-12 w-12 overflow-hidden rounded-full border border-border bg-card shadow-sm">
                       <img
                         src={cluster.source_url}
                         alt="aggregated face"
@@ -649,11 +651,11 @@ export function PipelineDashboard({ backendUrl }: Props) {
               </div>
             </section>
 
-            <section className="space-y-3 xl:col-span-1">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            <section className="phia-subpanel space-y-3 p-4 xl:col-span-1">
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 {`Google Image Response For "${personName}"`}
               </h3>
-              <div className="h-[520px] overflow-y-auto pr-1">
+              <div className="phia-scroll h-[520px] overflow-y-auto pr-1">
                 <div className="grid grid-cols-3 gap-2 lg:grid-cols-4">
                   {visibleSerpUrls.slice(0, 24).map((url, idx) => (
                     <a
@@ -661,7 +663,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
                       href={url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className={`overflow-hidden rounded-md border bg-muted ${
+                      className={`overflow-hidden rounded-xl border bg-white/80 shadow-sm ${
                         selectedMatchedUrlKeySet.has(imageKey(url))
                           ? "border-4 border-emerald-600"
                           : "border-border"
@@ -681,8 +683,8 @@ export function PipelineDashboard({ backendUrl }: Props) {
           </div>
 
           <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_240px]">
-            <section className="rounded-lg border border-border bg-muted p-3">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            <section className="phia-subpanel p-4">
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 Ask User To Confirm Their Face
               </h3>
               <div className="mt-2 space-y-1 text-sm">
@@ -718,11 +720,11 @@ export function PipelineDashboard({ backendUrl }: Props) {
               ) : null}
             </section>
 
-            <section className="rounded-lg border border-border bg-muted p-3 text-center">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Chosen Face</h3>
+            <section className="phia-subpanel p-4 text-center">
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Chosen Face</h3>
               {selectedCluster ? (
                 <>
-                  <div className="relative mx-auto mt-2 h-20 w-20 overflow-hidden rounded-full border border-border bg-card">
+                  <div className="relative mx-auto mt-2 h-20 w-20 overflow-hidden rounded-full border border-border bg-card shadow-sm">
                     <img
                       src={selectedCluster.source_url}
                       alt="chosen face"
@@ -736,33 +738,33 @@ export function PipelineDashboard({ backendUrl }: Props) {
                   ) : null}
                 </>
               ) : (
-                <div className="mt-3 rounded-md border border-dashed border-border bg-card px-3 py-4 text-sm text-muted-foreground">
+                <div className="mt-3 rounded-xl border border-dashed border-border bg-white/75 px-3 py-4 text-sm text-muted-foreground">
                   {shouldAskUserConfirm ? "Waiting on user response" : "No face chosen yet"}
                 </div>
               )}
             </section>
           </div>
 
-          <section className="space-y-3 rounded-lg border border-border bg-muted p-3">
-            <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+          <section className="phia-subpanel space-y-3 p-4">
+            <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
               Chosen Face Photo Breakdown
             </h3>
             {!selectedCluster ? (
-              <div className="rounded-md border border-dashed border-border bg-card px-3 py-4 text-sm text-muted-foreground">
+              <div className="rounded-xl border border-dashed border-border bg-white/75 px-3 py-4 text-sm text-muted-foreground">
                 Choose a face cluster to see photo/item/product breakdown.
               </div>
             ) : chosenFacePhotoRows.length === 0 ? (
-              <div className="rounded-md border border-dashed border-border bg-card px-3 py-4 text-sm text-muted-foreground">
+              <div className="rounded-xl border border-dashed border-border bg-white/75 px-3 py-4 text-sm text-muted-foreground">
                 No photos found for the chosen face yet.
               </div>
             ) : (
               <div className="space-y-3">
-                <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2">
+                <div className="flex items-center justify-between rounded-2xl border border-border bg-white/75 px-3 py-2">
                   <button
                     type="button"
                     onClick={() => setChosenFacePhotoIndex(chosenFacePhotoIndex - 1)}
                     disabled={chosenFacePhotoIndex === 0}
-                    className="rounded border border-border bg-background px-2 py-1 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                    className="phia-soft-button rounded-xl border border-border bg-background px-2 py-1 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     ← Previous
                   </button>
@@ -773,7 +775,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
                     type="button"
                     onClick={() => setChosenFacePhotoIndex(chosenFacePhotoIndex + 1)}
                     disabled={chosenFacePhotoIndex >= chosenFacePhotoRows.length - 1}
-                    className="rounded border border-border bg-background px-2 py-1 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                    className="phia-soft-button rounded-xl border border-border bg-background px-2 py-1 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     Next →
                   </button>
@@ -822,15 +824,15 @@ export function PipelineDashboard({ backendUrl }: Props) {
                     return (
                       <div
                         key={photo.id}
-                        className="grid h-[780px] gap-3 overflow-y-auto rounded-lg border border-border bg-card p-3 lg:grid-cols-[180px_minmax(0,1fr)]"
+                        className="phia-scroll grid h-[780px] gap-3 overflow-y-auto rounded-2xl border border-border bg-white/80 p-3 lg:grid-cols-[180px_minmax(0,1fr)]"
                       >
-                        <aside className="space-y-2 rounded-md border border-border bg-background p-2">
-                          <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Image View</div>
+                        <aside className="phia-subpanel space-y-2 p-2.5">
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Image View</div>
                           <button
                             type="button"
                             onClick={() => setActivePhotoViewMode("original")}
-                            className={`w-full rounded border px-2 py-2 text-left text-xs font-semibold ${
-                              activePhotoViewMode === "original" ? "border-accent bg-accent/10" : "border-border bg-card"
+                            className={`phia-soft-button w-full rounded-xl border px-2 py-2 text-left text-xs font-semibold ${
+                              activePhotoViewMode === "original" ? "border-accent bg-accent/12" : "border-border bg-card"
                             }`}
                           >
                             Original Image
@@ -838,8 +840,8 @@ export function PipelineDashboard({ backendUrl }: Props) {
                           <button
                             type="button"
                             onClick={() => setActivePhotoViewMode("vlm")}
-                            className={`w-full rounded border px-2 py-2 text-left text-xs font-semibold ${
-                              activePhotoViewMode === "vlm" ? "border-accent bg-accent/10" : "border-border bg-card"
+                            className={`phia-soft-button w-full rounded-xl border px-2 py-2 text-left text-xs font-semibold ${
+                              activePhotoViewMode === "vlm" ? "border-accent bg-accent/12" : "border-border bg-card"
                             }`}
                           >
                             VLM output
@@ -847,8 +849,8 @@ export function PipelineDashboard({ backendUrl }: Props) {
                           <button
                             type="button"
                             onClick={() => setActivePhotoViewMode("final")}
-                            className={`w-full rounded border px-2 py-2 text-left text-xs font-semibold ${
-                              activePhotoViewMode === "final" ? "border-accent bg-accent/10" : "border-border bg-card"
+                            className={`phia-soft-button w-full rounded-xl border px-2 py-2 text-left text-xs font-semibold ${
+                              activePhotoViewMode === "final" ? "border-accent bg-accent/12" : "border-border bg-card"
                             }`}
                           >
                             Final Image
@@ -864,7 +866,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
                         <section className="space-y-3">
                           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_220px] md:items-start">
                             <div
-                              className="relative mx-auto w-full max-w-[360px] overflow-hidden rounded-md border border-border bg-background"
+                              className="relative mx-auto w-full max-w-[360px] overflow-hidden rounded-2xl border border-border bg-background"
                               style={{ aspectRatio: photoAspect }}
                             >
                               <img src={photo.url} alt="photo breakdown image" className="absolute inset-0 h-full w-full object-contain" />
@@ -899,16 +901,16 @@ export function PipelineDashboard({ backendUrl }: Props) {
                             </div>
 
                             {activePhotoViewMode !== "original" ? (
-                              <aside className="rounded-md border border-border bg-background p-2">
-                                <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                              <aside className="phia-subpanel p-2.5">
+                                <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                                   {activePhotoViewMode === "vlm" ? "VLM Labels" : "Final Labels"}
                                 </div>
-                                <div className="mt-2 max-h-[360px] space-y-1 overflow-y-auto pr-1">
+                                <div className="phia-scroll mt-2 max-h-[360px] space-y-1 overflow-y-auto pr-1">
                                   {legendEntries.length === 0 ? (
                                     <div className="text-xs text-muted-foreground">No detections yet.</div>
                                   ) : (
                                     legendEntries.map((entry) => (
-                                      <div key={`${photo.id}-legend-${entry.index}`} className="flex items-start gap-2 rounded border border-border bg-card px-2 py-1">
+                                      <div key={`${photo.id}-legend-${entry.index}`} className="flex items-start gap-2 rounded-xl border border-border bg-card px-2 py-1">
                                         <span
                                           className={`mt-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded text-[10px] font-semibold ${
                                             activePhotoViewMode === "vlm"
@@ -928,12 +930,12 @@ export function PipelineDashboard({ backendUrl }: Props) {
                           </div>
 
                           <section>
-                            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                            <div className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                               Products In This Photo
                             </div>
-                            <div className="h-64 overflow-y-auto pr-1">
+                            <div className="phia-scroll h-64 overflow-y-auto pr-1">
                               {items.length === 0 ? (
-                                <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                                <div className="rounded-xl border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
                                   No extracted items yet.
                                 </div>
                               ) : (
@@ -944,21 +946,21 @@ export function PipelineDashboard({ backendUrl }: Props) {
 
                                   if (matchedProducts.length === 0) {
                                     return (
-                                      <div className="rounded-md border border-dashed border-border px-2 py-1 text-[11px] text-muted-foreground">
+                                      <div className="rounded-xl border border-dashed border-border px-2 py-1 text-[11px] text-muted-foreground">
                                         Serp lookup pending / no strong match yet.
                                       </div>
                                     );
                                   }
 
                                   return (
-                                    <div className="flex gap-3 overflow-x-auto pb-2">
+                                    <div className="phia-scroll flex gap-3 overflow-x-auto pb-2">
                                       {matchedProducts.map(({ item, match }) => (
                                         <a
                                           key={`${item.id}-${match?.link || "match"}`}
                                           href={match?.link}
                                           target="_blank"
                                           rel="noopener noreferrer"
-                                          className="w-36 shrink-0 rounded-md border border-border bg-background p-2"
+                                          className="phia-soft-button w-36 shrink-0 rounded-xl border border-border bg-background p-2"
                                         >
                                           {match?.thumbnail ? (
                                             <img src={match.thumbnail} alt={match.title || "matched product"} className="h-32 w-32 rounded object-cover" />
@@ -983,16 +985,16 @@ export function PipelineDashboard({ backendUrl }: Props) {
                   })()
                 ) : null}
 
-                <section className="rounded-lg border border-border bg-card p-3">
-                  <div className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <section className="phia-subpanel p-4">
+                  <div className="mb-2 text-sm font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                     Closet
                   </div>
                   {closetProducts.length === 0 ? (
-                    <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                    <div className="rounded-xl border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
                       No product items found yet.
                     </div>
                   ) : (
-                    <div className="max-h-[720px] overflow-y-auto pr-1">
+                    <div className="phia-scroll max-h-[720px] overflow-y-auto pr-1">
                       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
                         {closetProducts.map(({ item, match }) => (
                           <a
@@ -1000,7 +1002,7 @@ export function PipelineDashboard({ backendUrl }: Props) {
                             href={match?.link}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="rounded-md border border-border bg-background p-2"
+                            className="phia-soft-button rounded-xl border border-border bg-background p-2"
                           >
                             {match?.thumbnail ? (
                               <img src={match.thumbnail} alt={match.title || item.description} className="h-28 w-full rounded object-cover" />
