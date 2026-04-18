@@ -48,6 +48,15 @@ uvicorn app.main:app --reload
 
 Backend defaults to `http://localhost:8000`.
 
+### Supabase Buckets (Optional, Recommended)
+
+```bash
+cd backend
+./scripts/setup_supabase_buckets.sh
+```
+
+This creates/ensures public buckets: `photos`, `face-tiles`, `clothing-crops`.
+
 ## Endpoints
 
 - `GET /health`
@@ -68,4 +77,5 @@ Use `.env.example` as the source of truth.
 - `AUTO_FACE_PICK_*` controls deterministic auto-pick thresholds.
 - `SERPAPI_KEY` enables exact/similar shopping candidates.
 - `REPLICATE_API_TOKEN` enables optional bbox refinement.
-- `PUBLIC_MEDIA_BASE_URL` should be a publicly reachable base URL for this backend when external services need to fetch your media.
+- Preferred: set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` to mirror `photoAlbumClosetApp` storage behavior. The backend uploads `photos/*`, `face_tiles/*`, and `clothing_crops/*` into public Supabase buckets and uses those public URLs for external model calls.
+- Fallback: `PUBLIC_MEDIA_BASE_URL` can be used as a publicly reachable backend URL when external services need to fetch `/media/*`.

@@ -90,6 +90,34 @@ type FaceDetection = {
   confidence: number;
 };
 
+type ClothingItem = {
+  id: string;
+  photo_id: string;
+  category: string;
+  description: string;
+  confidence: number;
+  tier: string;
+  bounding_box: {
+    x?: number;
+    y?: number;
+    w?: number;
+    h?: number;
+    left?: number;
+    top?: number;
+    width?: number;
+    height?: number;
+  };
+  crop_url?: string | null;
+  best_match?: {
+    title?: string;
+    source?: string;
+    price?: string | null;
+    link?: string;
+    thumbnail?: string;
+  } | null;
+  best_match_confidence?: number;
+};
+
 type JobDetail = JobSummary & {
   selected_cluster_id: string | null;
   photos: {
@@ -107,6 +135,7 @@ type JobDetail = JobSummary & {
     member_count: number;
     source_url: string;
   }[];
+  items: ClothingItem[];
   debug?: JobDebug;
 };
 
@@ -174,6 +203,23 @@ function getFaceCropStyle(
     maxWidth: "none",
     maxHeight: "none",
     objectFit: "fill",
+  };
+}
+
+function getItemBoxStyle(
+  bb: ClothingItem["bounding_box"] | null | undefined
+): React.CSSProperties {
+  const x = Math.max(0, Math.min(1, Number(bb?.x ?? bb?.left ?? 0)));
+  const y = Math.max(0, Math.min(1, Number(bb?.y ?? bb?.top ?? 0)));
+  const w = Math.max(0, Math.min(1, Number(bb?.w ?? bb?.width ?? 0)));
+  const h = Math.max(0, Math.min(1, Number(bb?.h ?? bb?.height ?? 0)));
+
+  return {
+    position: "absolute",
+    left: `${x * 100}%`,
+    top: `${y * 100}%`,
+    width: `${w * 100}%`,
+    height: `${h * 100}%`,
   };
 }
 
@@ -263,6 +309,37 @@ export function PipelineDashboard({ backendUrl }: Props) {
     const urls = row?.matched_urls ?? [];
     return new Set(urls.map((u) => imageKey(u)));
   }, [detail?.debug?.auto_face_score?.scored_clusters, selectedCluster?.id]);
+
+  const itemsByPhoto = useMemo(() => {
+    const map = new Map<string, ClothingItem[]>();
+    for (const item of detail?.items ?? []) {
+      const arr = map.get(item.photo_id) ?? [];
+      arr.push(item);
+      map.set(item.photo_id, arr);
+    }
+    return map;
+  }, [detail?.items]);
+
+  const selectedClusterPhotoIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!selectedCluster) return ids;
+    for (const det of detail?.face_detections ?? []) {
+      if (det.cluster_id === selectedCluster.id) {
+        ids.add(det.photo_id);
+      }
+    }
+    return ids;
+  }, [detail?.face_detections, selectedCluster]);
+
+  const chosenFacePhotoRows = useMemo(() => {
+    if (!detail) return [];
+    return detail.photos
+      .filter((p) => selectedClusterPhotoIds.has(p.id))
+      .map((photo) => ({
+        photo,
+        items: itemsByPhoto.get(photo.id) ?? [],
+      }));
+  }, [detail, selectedClusterPhotoIds, itemsByPhoto]);
 
   useEffect(() => {
     let cancelled = false;
@@ -528,6 +605,119 @@ export function PipelineDashboard({ backendUrl }: Props) {
               )}
             </section>
           </div>
+
+          <section className="space-y-3 rounded-lg border border-border bg-muted p-3">
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Chosen Face Photo Breakdown
+            </h3>
+            {!selectedCluster ? (
+              <div className="rounded-md border border-dashed border-border bg-card px-3 py-4 text-sm text-muted-foreground">
+                Choose a face cluster to see photo/item/product breakdown.
+              </div>
+            ) : chosenFacePhotoRows.length === 0 ? (
+              <div className="rounded-md border border-dashed border-border bg-card px-3 py-4 text-sm text-muted-foreground">
+                No photos found for the chosen face yet.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Photos With Chosen Face
+                  </div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Products In This Photo
+                  </div>
+                </div>
+
+                {chosenFacePhotoRows.map(({ photo, items }) => {
+                  const photoAspect =
+                    (photo.width ?? 0) > 0 && (photo.height ?? 0) > 0
+                      ? `${photo.width} / ${photo.height}`
+                      : "1 / 1";
+                  return (
+                    <div key={photo.id} className="grid gap-3 rounded-lg border border-border bg-card p-3 lg:grid-cols-2">
+                    <section>
+                      <div
+                        className="relative w-full overflow-hidden rounded-md border border-border bg-background"
+                        style={{ aspectRatio: photoAspect }}
+                      >
+                        <img src={photo.url} alt="item boxes overlay" className="absolute inset-0 h-full w-full object-fill" />
+                        {items.map((item) => (
+                          <div key={`${photo.id}-${item.id}`} className="pointer-events-none absolute" style={getItemBoxStyle(item.bounding_box)}>
+                            <div className="h-full w-full border-2 border-sky-500" />
+                            <span className="absolute left-0 top-0 bg-sky-500 px-1 py-0.5 text-[10px] font-semibold text-white">
+                              {item.category}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
+                        <span>photo {photo.id.slice(0, 8)}</span>
+                        <span>{items.length} items detected</span>
+                      </div>
+                    </section>
+
+                    <section>
+                      {items.length === 0 ? (
+                        <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                          No extracted items yet.
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {items.map((item) => {
+                            const match = item.best_match;
+                            return (
+                              <div key={item.id} className="rounded-md border border-border bg-background p-2">
+                                <div className="flex items-start gap-2">
+                                  {item.crop_url ? (
+                                    <img src={item.crop_url} alt="item crop" className="h-12 w-12 rounded object-cover" />
+                                  ) : (
+                                    <div className="h-12 w-12 rounded bg-muted" />
+                                  )}
+                                  <div className="min-w-0 flex-1">
+                                    <div className="truncate text-xs font-semibold">{item.description}</div>
+                                    <div className="text-[11px] text-muted-foreground">
+                                      {item.category} • {item.tier}
+                                    </div>
+                                  </div>
+                                </div>
+                                {match?.link ? (
+                                  <a
+                                    href={match.link}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="mt-2 flex items-center gap-2 rounded border border-border bg-card p-2"
+                                  >
+                                    {match.thumbnail ? (
+                                      <img src={match.thumbnail} alt="matched product" className="h-10 w-10 rounded object-cover" />
+                                    ) : (
+                                      <div className="h-10 w-10 rounded bg-muted" />
+                                    )}
+                                    <div className="min-w-0 flex-1">
+                                      <div className="truncate text-xs font-semibold">{match.title || "Matched product"}</div>
+                                      <div className="text-[11px] text-muted-foreground">
+                                        {match.source || "Unknown source"}
+                                        {match.price ? ` • ${match.price}` : ""}
+                                      </div>
+                                    </div>
+                                  </a>
+                                ) : (
+                                  <div className="mt-2 rounded border border-dashed border-border px-2 py-1 text-[11px] text-muted-foreground">
+                                    Product lookup pending / no strong match yet.
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </section>
       )}
     </div>

@@ -95,6 +95,8 @@ _RUNNING_FACE_JOBS: set[str] = set()
 _RUNNING_CLOTHING_RUNS: set[str] = set()
 _RUNNING_LOOKUPS: set[str] = set()
 _RUN_LOCK = threading.Lock()
+_SUPABASE_UPLOAD_LOCK = threading.Lock()
+_UPLOADED_SUPABASE_MEDIA: set[str] = set()
 _LOOKUP_SEMAPHORE: threading.Semaphore | None = None
 _SETTINGS: Settings | None = None
 _REPLICATE_YOLO_VERSION: str | None = None
@@ -121,14 +123,92 @@ def media_rel_to_url(media_base_url: str, relative_path: str) -> str:
     return f"{media_base_url.rstrip('/')}/{safe}"
 
 
+def _supabase_enabled(settings: Settings) -> bool:
+    return bool(settings.supabase_url.strip() and settings.supabase_service_role_key.strip())
+
+
+def _supabase_bucket_and_key(settings: Settings, relative_path: str) -> tuple[str, str] | None:
+    safe = relative_path.lstrip("/").replace("\\", "/")
+    if safe.startswith("photos/"):
+        return settings.supabase_photos_bucket, safe[len("photos/") :]
+    if safe.startswith("face_tiles/"):
+        return settings.supabase_face_tiles_bucket, safe[len("face_tiles/") :]
+    if safe.startswith("clothing_crops/"):
+        return settings.supabase_clothing_crops_bucket, safe[len("clothing_crops/") :]
+    return None
+
+
+def _supabase_public_url(settings: Settings, bucket: str, key: str) -> str:
+    base = settings.supabase_url.strip().rstrip("/")
+    return f"{base}/storage/v1/object/public/{bucket}/{key}"
+
+
+def _upload_media_to_supabase(relative_path: str) -> bool:
+    settings = _settings()
+    if not _supabase_enabled(settings):
+        return False
+
+    safe = relative_path.lstrip("/").replace("\\", "/")
+    bucket_key = _supabase_bucket_and_key(settings, safe)
+    if not bucket_key:
+        return False
+    bucket, key = bucket_key
+
+    with _SUPABASE_UPLOAD_LOCK:
+        if safe in _UPLOADED_SUPABASE_MEDIA:
+            return True
+
+    abs_path = settings.media_dir / safe
+    if not abs_path.exists():
+        return False
+
+    try:
+        body = abs_path.read_bytes()
+    except Exception:
+        return False
+    if not body:
+        return False
+
+    try:
+        res = requests.post(
+            f"{settings.supabase_url.rstrip('/')}/storage/v1/object/{bucket}/{key}",
+            headers={
+                "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                "apikey": settings.supabase_service_role_key,
+                "x-upsert": "true",
+                "content-type": "image/jpeg",
+            },
+            data=body,
+            timeout=20,
+        )
+    except Exception:
+        return False
+
+    if res.status_code >= 300:
+        return False
+
+    with _SUPABASE_UPLOAD_LOCK:
+        _UPLOADED_SUPABASE_MEDIA.add(safe)
+    return True
+
+
 def _external_media_url(relative_path: str | None) -> str | None:
     if not relative_path:
         return None
     settings = _settings()
+    safe = relative_path.lstrip("/").replace("\\", "/")
+
+    if _supabase_enabled(settings):
+        bucket_key = _supabase_bucket_and_key(settings, safe)
+        if bucket_key:
+            uploaded = _upload_media_to_supabase(safe)
+            if uploaded:
+                bucket, key = bucket_key
+                return _supabase_public_url(settings, bucket, key)
+
     base = settings.public_media_base_url.strip()
     if not base:
         return None
-    safe = relative_path.lstrip("/").replace("\\", "/")
     return f"{base.rstrip('/')}/media/{safe}"
 
 

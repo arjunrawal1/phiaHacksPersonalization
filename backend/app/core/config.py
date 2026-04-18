@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     sqlite_path: Path = Path("./data/phia.db")
     media_dir: Path = Path("./data/media")
     public_media_base_url: str = ""
+    supabase_url: str = ""
+    supabase_service_role_key: str = ""
+    supabase_photos_bucket: str = "photos"
+    supabase_face_tiles_bucket: str = "face-tiles"
+    supabase_clothing_crops_bucket: str = "clothing-crops"
 
     openai_api_key: str = ""
     openai_model: str = "gpt-5.4"
