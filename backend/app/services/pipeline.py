@@ -304,6 +304,7 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
         {
             "id": i["id"],
             "photo_id": i["photo_id"],
+            "closet_item_key": str(i.get("closet_item_key") or i["id"]),
             "category": i["category"],
             "description": i["description"],
             "colors": i["colors"],
@@ -1486,6 +1487,10 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
             face_tile_rel = _save_face_tile(photo_path, job_id, photo_id, face_bbox)
             face_tile_path = settings.media_dir / face_tile_rel
 
+            # Start auto styling per photo immediately (in parallel with item lookup),
+            # instead of waiting for downstream product matching to finish.
+            start_styling_auto_run(job_id=job_id, photo_id=photo_id)
+
             step: dict[str, Any] = {
                 "photo_id": photo_id,
                 "photo_relative_path": photo["relative_path"],
@@ -1616,6 +1621,13 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                     item_ids.extend(result.get("item_ids", []))
                     per_photo_steps.append(result.get("step", {}))
 
+        closet_key_by_item, dedupe_source = _assign_closet_item_keys(job_id, item_ids)
+        unique_closet_item_count = (
+            len(set(closet_key_by_item.values()))
+            if closet_key_by_item
+            else len(set(item_ids))
+        )
+
         db.update_job(job_id, status="done", error=None)
         _debug_patch(
             job_id,
@@ -1623,6 +1635,8 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                 "stages": {"clothing_extraction": "complete"},
                 "clothing_extraction": {
                     "item_count": len(item_ids),
+                    "closet_item_count": unique_closet_item_count,
+                    "closet_dedupe_source": dedupe_source,
                     "photo_count": len(entries),
                     "finished_at": db.utc_now_iso(),
                     "per_photo_steps": per_photo_steps[:120],
@@ -1630,7 +1644,10 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
             },
             event={
                 "type": "clothing_extraction_complete",
-                "message": f"Clothing extraction complete with {len(item_ids)} items",
+                "message": (
+                    "Clothing extraction complete with "
+                    f"{len(item_ids)} photo-tagged items and {unique_closet_item_count} closet cards"
+                ),
             },
         )
         for item_id in item_ids:
@@ -1769,26 +1786,8 @@ def _lookup_item_worker(item_id: str) -> None:
             best_match_confidence=best_confidence,
             crop_path=crop_rel,
         )
-
-        if _photo_has_any_best_match_link(item["photo_id"]):
-            start_styling_auto_run(
-                job_id=item["job_id"],
-                photo_id=item["photo_id"],
-                trigger_item_id=item_id,
-            )
     except Exception as exc:  # pragma: no cover
         print(TAG, "lookup failed", item_id, exc)
-
-
-def _photo_has_any_best_match_link(photo_id: str) -> bool:
-    items = db.list_clothing_items_for_photo(photo_id)
-    for item in items:
-        best = item.get("best_match")
-        if isinstance(best, dict):
-            link = str(best.get("link") or "").strip()
-            if link:
-                return True
-    return False
 
 
 def _detect_person_boxes_for_styling(source_photo_relative_path: str) -> tuple[list[tuple[int, int, int, int]], dict[str, Any]]:
@@ -2222,6 +2221,226 @@ def _extract_items_from_detections(
     with Image.open(photo_path).convert("RGB") as image:
         img_w, img_h = image.size
     return _fallback_items_from_detections(detections, img_w, img_h), "fallback"
+
+
+def _assign_closet_item_keys(job_id: str, item_ids: list[str]) -> tuple[dict[str, str], str]:
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in item_ids:
+        item_id = str(raw or "").strip()
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        ordered_ids.append(item_id)
+
+    if not ordered_ids:
+        return {}, "none"
+
+    rows: list[dict[str, Any]] = []
+    for item_id in ordered_ids:
+        row = db.get_clothing_item(item_id)
+        if row:
+            rows.append(row)
+
+    if not rows:
+        return {}, "none"
+
+    mapping: dict[str, str] = {}
+    source = "fallback"
+    if len(rows) == 1:
+        only_id = str(rows[0]["id"])
+        mapping = {only_id: only_id}
+        source = "single"
+    else:
+        openai_mapping = _dedupe_closet_items_with_openai(rows)
+        if openai_mapping:
+            mapping = openai_mapping
+            source = "openai"
+        else:
+            mapping = _dedupe_closet_items_with_fallback(rows)
+
+    valid_ids = {str(row["id"]) for row in rows}
+    final: dict[str, str] = {}
+    for row in rows:
+        item_id = str(row["id"])
+        canonical = str(mapping.get(item_id) or "").strip()
+        if canonical not in valid_ids:
+            canonical = item_id
+        db.update_clothing_item_closet_key(item_id, canonical)
+        final[item_id] = canonical
+
+    return final, source
+
+
+def _dedupe_closet_items_with_openai(items: list[dict[str, Any]]) -> dict[str, str]:
+    settings = _settings()
+    if not settings.openai_api_key or len(items) < 2:
+        return {}
+
+    candidates = items[:120]
+    payload_items: list[dict[str, Any]] = []
+    valid_ids: set[str] = set()
+    for row in candidates:
+        item_id = str(row.get("id") or "").strip()
+        if not item_id:
+            continue
+        valid_ids.add(item_id)
+        payload_items.append(
+            {
+                "item_id": item_id,
+                "photo_id": str(row.get("photo_id") or ""),
+                "category": str(row.get("category") or ""),
+                "description": str(row.get("description") or ""),
+                "colors": [str(c) for c in (row.get("colors") or []) if str(c).strip()],
+                "pattern": str(row.get("pattern") or ""),
+                "style": str(row.get("style") or ""),
+                "brand_visible": str(row.get("brand_visible") or ""),
+                "confidence": float(row.get("confidence") or 0),
+            }
+        )
+
+    if len(payload_items) < 2:
+        return {}
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "canonical_assignments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "canonical_item_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["item_id", "canonical_item_id", "reason"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["canonical_assignments"],
+        "additionalProperties": False,
+    }
+
+    instructions = (
+        "You are deduplicating closet items extracted from multiple photos of the SAME person.\n"
+        "Goal: assign each item to a canonical item id so duplicate detections of the same physical garment "
+        "(for example, the same jacket in two photos) share one canonical id.\n"
+        "Rules:\n"
+        "1) Only merge when it is very likely the same physical item, not merely a similar category.\n"
+        "2) If uncertain, keep separate by mapping an item to itself.\n"
+        "3) canonical_item_id MUST be one of the provided item_id values.\n"
+        "4) Return one assignment per provided item.\n"
+        "5) Prefer the highest-confidence item as canonical within a duplicate group.\n"
+        f"Items JSON:\n{json.dumps(payload_items)}"
+    )
+
+    payload = {
+        "model": settings.openai_model,
+        "reasoning": {"effort": "low"},
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": instructions}],
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "closet_item_dedupe",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(TAG, "openai closet dedupe failed", exc)
+        return {}
+
+    raw = data.get("output_text")
+    if not raw:
+        for out in data.get("output", []):
+            for content in out.get("content", []):
+                if content.get("type") == "output_text" and content.get("text"):
+                    raw = content["text"]
+                    break
+            if raw:
+                break
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    assignments = parsed.get("canonical_assignments") if isinstance(parsed, dict) else None
+    if not isinstance(assignments, list):
+        return {}
+
+    out: dict[str, str] = {}
+    for entry in assignments:
+        if not isinstance(entry, dict):
+            continue
+        item_id = str(entry.get("item_id") or "").strip()
+        canonical_item_id = str(entry.get("canonical_item_id") or "").strip()
+        if item_id not in valid_ids or canonical_item_id not in valid_ids:
+            continue
+        out[item_id] = canonical_item_id
+    return out
+
+
+def _dedupe_closet_items_with_fallback(items: list[dict[str, Any]]) -> dict[str, str]:
+    canonical_by_signature: dict[str, str] = {}
+    mapping: dict[str, str] = {}
+    for row in sorted(
+        items,
+        key=lambda r: (
+            str(r.get("created_at") or ""),
+            -float(r.get("confidence") or 0),
+        ),
+    ):
+        item_id = str(row.get("id") or "").strip()
+        if not item_id:
+            continue
+        signature = _closet_item_signature(row)
+        canonical = canonical_by_signature.get(signature)
+        if canonical is None:
+            canonical = item_id
+            canonical_by_signature[signature] = canonical
+        mapping[item_id] = canonical
+    return mapping
+
+
+def _closet_item_signature(item: dict[str, Any]) -> str:
+    description = _compact_search_description(
+        str(item.get("description") or ""),
+        fallback=str(item.get("category") or "clothing item"),
+    )
+    normalized_colors = sorted(
+        {
+            re.sub(r"[^a-z0-9]", "", str(color or "").lower())
+            for color in (item.get("colors") or [])
+        }
+    )
+    color_key = ",".join([c for c in normalized_colors if c][:2])
+    pattern = re.sub(r"[^a-z0-9]", "", str(item.get("pattern") or "").lower())
+    style = re.sub(r"[^a-z0-9]", "", str(item.get("style") or "").lower())
+    brand = re.sub(r"[^a-z0-9]", "", str(item.get("brand_visible") or "").lower())
+    return "|".join([description, color_key, pattern, style, brand])
 
 
 def _extract_items_from_detections_with_openai(

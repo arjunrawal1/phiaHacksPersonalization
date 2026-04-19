@@ -145,6 +145,7 @@ type FaceDetection = {
 type ClothingItem = {
   id: string;
   photo_id: string;
+  closet_item_key?: string;
   category: string;
   description: string;
   confidence: number;
@@ -464,10 +465,23 @@ export function PipelineDashboard({ backendUrl }: Props) {
       }));
   }, [detail, selectedClusterPhotoIds, itemsByPhoto]);
   const closetProducts = useMemo(() => {
-    return chosenFacePhotoRows
-      .flatMap(({ items }) => items)
-      .map((item) => ({ item, match: item.best_match }))
-      .filter((entry) => !!entry.match?.link);
+    const deduped = new Map<string, { item: ClothingItem; match: ClothingItem["best_match"] }>();
+    for (const item of chosenFacePhotoRows.flatMap(({ items }) => items)) {
+      const match = item.best_match;
+      if (!match?.link) continue;
+      const canonicalKey = (item.closet_item_key ?? "").trim() || item.id;
+      const existing = deduped.get(canonicalKey);
+      if (!existing) {
+        deduped.set(canonicalKey, { item, match });
+        continue;
+      }
+      const currentScore = item.best_match_confidence ?? 0;
+      const previousScore = existing.item.best_match_confidence ?? 0;
+      if (currentScore > previousScore) {
+        deduped.set(canonicalKey, { item, match });
+      }
+    }
+    return Array.from(deduped.values());
   }, [chosenFacePhotoRows]);
   const closetProductUrls = useMemo(() => {
     const out: string[] = [];

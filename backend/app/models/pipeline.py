@@ -84,6 +84,7 @@ class BestMatch(BaseModel):
 class ClothingItemOut(BaseModel):
     id: str
     photo_id: str
+    closet_item_key: str
     category: str
     description: str
     colors: list[str] = Field(default_factory=list)

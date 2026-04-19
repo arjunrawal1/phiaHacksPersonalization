@@ -102,6 +102,7 @@ def init_db(db_path: Path) -> None:
                 id TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
                 photo_id TEXT NOT NULL,
+                closet_item_key TEXT,
                 category TEXT NOT NULL,
                 description TEXT NOT NULL,
                 colors TEXT NOT NULL,
@@ -200,10 +201,18 @@ def init_db(db_path: Path) -> None:
             row["name"]
             for row in conn.execute("PRAGMA table_info(clothing_items)").fetchall()
         }
+        if "closet_item_key" not in existing_columns:
+            conn.execute("ALTER TABLE clothing_items ADD COLUMN closet_item_key TEXT")
         if "phia_products" not in existing_columns:
             conn.execute(
                 "ALTER TABLE clothing_items ADD COLUMN phia_products TEXT NOT NULL DEFAULT '[]'"
             )
+        conn.execute(
+            "UPDATE clothing_items SET closet_item_key = id WHERE closet_item_key IS NULL OR trim(closet_item_key) = ''"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clothing_items_job_closet_item_key ON clothing_items(job_id, closet_item_key)"
+        )
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -553,22 +562,25 @@ def insert_clothing_item(
     phia_products: list[dict[str, Any]],
     best_match: dict[str, Any] | None,
     best_match_confidence: float,
+    closet_item_key: str | None = None,
 ) -> str:
     item_id = str(uuid.uuid4())
+    item_key = (closet_item_key or "").strip() or item_id
     now = utc_now_iso()
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO clothing_items (
-                id, job_id, photo_id, category, description, colors, pattern, style,
+                id, job_id, photo_id, closet_item_key, category, description, colors, pattern, style,
                 brand_visible, visibility, confidence, bounding_box, crop_path, tier,
                 exact_matches, similar_products, phia_products, best_match, best_match_confidence, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
                 job_id,
                 photo_id,
+                item_key,
                 category,
                 description,
                 json.dumps(colors),
@@ -620,6 +632,17 @@ def update_clothing_item(
                 crop_path,
                 item_id,
             ),
+        )
+
+
+def update_clothing_item_closet_key(item_id: str, closet_item_key: str) -> None:
+    key = (closet_item_key or "").strip()
+    if not key:
+        return
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE clothing_items SET closet_item_key = ? WHERE id = ?",
+            (key, item_id),
         )
 
 

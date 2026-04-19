@@ -66,7 +66,7 @@ def test_auto_generate_skips_when_body_not_visible(tmp_path, monkeypatch) -> Non
         photo_id="photo",
         source_photo_relative_path=photo_rel,
         face_crop_relative_path=face_rel,
-        person_boxes=[(100, 120, 420, 1000)],
+        person_boxes=[(120, 160, 300, 520)],
     )
     assert result["status"] == "skipped"
     assert "occluded" in str(result["skip_reason"]).lower()

@@ -4,10 +4,8 @@ import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import * as MediaLibrary from 'expo-media-library';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   Animated,
   Image,
-  Linking,
   Modal,
   Platform,
   Pressable,
@@ -418,29 +416,6 @@ const SIM_PHIA_BEARER = (process.env.EXPO_PUBLIC_SIM_PHIA_BEARER ?? '').trim();
 const SIM_PHIA_PLATFORM = (process.env.EXPO_PUBLIC_SIM_PHIA_PLATFORM ?? '').trim();
 const SIM_PHIA_PLATFORM_VERSION = (process.env.EXPO_PUBLIC_SIM_PHIA_PLATFORM_VERSION ?? '').trim();
 
-function statusLabel(status: SyncStatus): string {
-  switch (status) {
-    case 'requesting-permission':
-      return 'Requesting camera roll permission';
-    case 'reading-camera-roll':
-      return 'Reading most recent photos';
-    case 'uploading':
-      return 'Uploading photos';
-    case 'analyzing_faces':
-      return 'Analyzing faces';
-    case 'awaiting_face_pick':
-      return 'Select your face cluster';
-    case 'extracting_clothing':
-      return 'Extracting clothing labels';
-    case 'done':
-      return 'Done';
-    case 'failed':
-      return 'Failed';
-    default:
-      return 'Idle';
-  }
-}
-
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BACKEND}${path}`, init);
   if (!res.ok) {
@@ -488,6 +463,17 @@ function isoFromEpochMs(value: number | null | undefined): string | null {
   }
 }
 
+function normalizeCoordinate(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 async function preprocessAssetUri(
   sourceUri: string,
   width: number,
@@ -513,29 +499,6 @@ async function preprocessAssetUri(
   return processed.uri;
 }
 
-function getFaceCropStyle(
-  bb: FaceClusterOut['rep_bbox'],
-  aspectRatio: number,
-) {
-  const safeAspectRatio = aspectRatio > 0 ? aspectRatio : 1;
-  const visibleFraction = Math.max(bb.width, bb.height) * 1.8;
-  const scale = FACE_PICKER_CIRCLE_SIZE / Math.max(visibleFraction, 0.0001);
-
-  const imgW = scale * (safeAspectRatio >= 1 ? 1 : safeAspectRatio);
-  const imgH = scale * (safeAspectRatio >= 1 ? 1 / safeAspectRatio : 1);
-
-  const centerX = bb.left + bb.width / 2;
-  const centerY = bb.top + bb.height / 2;
-
-  return {
-    position: 'absolute' as const,
-    width: imgW,
-    height: imgH,
-    left: FACE_PICKER_CIRCLE_SIZE / 2 - centerX * imgW,
-    top: FACE_PICKER_CIRCLE_SIZE / 2 - centerY * imgH,
-  };
-}
-
 function serifStyle(isItalic = false) {
   return {
     fontFamily: Platform.select({
@@ -548,14 +511,9 @@ function serifStyle(isItalic = false) {
 }
 
 export default function Index() {
-  const [status, setStatus] = useState<SyncStatus>('idle');
-  const [job, setJob] = useState<JobDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [uploadCount, setUploadCount] = useState<{ total: number; uploaded: number }>({
-    total: 0,
-    uploaded: 0,
-  });
-  const [busySelectCluster, setBusySelectCluster] = useState<string | null>(null);
+  const [, setStatus] = useState<SyncStatus>('idle');
+  const [, setJob] = useState<JobDetail | null>(null);
+  const [, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>('home');
   const [savedTab, setSavedTab] = useState<SavedTab>('items');
   const [searchText, setSearchText] = useState('');
@@ -567,6 +525,7 @@ export default function Index() {
   const [bottomNavTrackWidth, setBottomNavTrackWidth] = useState(0);
   const bottomNavHighlightX = useRef(new Animated.Value(0)).current;
   const searchInputRef = useRef<TextInput | null>(null);
+  const tabSequenceRef = useRef<MainTab[]>([]);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const bottomTabWidth = bottomNavTrackWidth > 0 ? bottomNavTrackWidth / MAIN_TABS.length : 0;
@@ -688,7 +647,20 @@ export default function Index() {
       setError(null);
       setJob(null);
       setStatus('requesting-permission');
-      setUploadCount({ total: 0, uploaded: 0 });
+
+      // iOS only shows the initial system permission alert once.
+      // When already granted, trigger Apple's permission picker so the user
+      // can re-confirm or adjust the selected photos before every sync.
+      if (Platform.OS === 'ios') {
+        try {
+          const existing = await MediaLibrary.getPermissionsAsync();
+          if (existing.status === 'granted') {
+            await MediaLibrary.presentPermissionsPickerAsync();
+          }
+        } catch {
+          // Best effort only; continue to the normal permission request path.
+        }
+      }
 
       const permission = await MediaLibrary.requestPermissionsAsync();
       if (permission.status !== 'granted') {
@@ -711,7 +683,6 @@ export default function Index() {
       }
 
       const assetsToUpload = result.assets.slice(0, MOST_RECENT_LIMIT);
-      setUploadCount({ total: assetsToUpload.length, uploaded: 0 });
 
       setStatus('uploading');
       const form = new FormData();
@@ -727,10 +698,9 @@ export default function Index() {
         const capturedAtEpochMs = normalizeEpochMs(
           asset.creationTime ?? ((info as any)?.creationTime as number | undefined),
         );
-        const latitude =
-          typeof info.location?.latitude === 'number' ? info.location.latitude : null;
-        const longitude =
-          typeof info.location?.longitude === 'number' ? info.location.longitude : null;
+        // Expo iOS may surface asset.location coordinates as strings.
+        const latitude = normalizeCoordinate((info.location as any)?.latitude);
+        const longitude = normalizeCoordinate((info.location as any)?.longitude);
         const metadata = {
           asset_id: asset.id ?? null,
           captured_at_epoch_ms: capturedAtEpochMs,
@@ -748,7 +718,6 @@ export default function Index() {
         } as any);
         form.append('photo_metadata', JSON.stringify(metadata));
         uploaded += 1;
-        setUploadCount({ total: assetsToUpload.length, uploaded });
       }
 
       if (uploaded === 0) {
@@ -773,58 +742,15 @@ export default function Index() {
     }
   }, [beginPolling, userNameForSync]);
 
-  const chooseCluster = useCallback(
-    async (clusterId: string) => {
-      if (!job) return;
-      setBusySelectCluster(clusterId);
-      try {
-        const selected = await fetchJson<{ job: JobDetail }>(`/api/jobs/${job.id}/select-cluster`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cluster_id: clusterId }),
-        });
-        setJob(selected.job);
-        setStatus(selected.job.status);
-        beginPolling(job.id);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        setBusySelectCluster(null);
-      }
-    },
-    [beginPolling, job],
-  );
-
-  const groupedByPhoto = useMemo(() => {
-    if (!job) return [] as { photo: PhotoOut; items: ClothingItemOut[] }[];
-    const byPhoto = new Map<string, ClothingItemOut[]>();
-    for (const item of job.items) {
-      const arr = byPhoto.get(item.photo_id) ?? [];
-      arr.push(item);
-      byPhoto.set(item.photo_id, arr);
+  const handleMainTabPress = useCallback((tab: MainTab) => {
+    setActiveTab(tab);
+    const sequence = [...tabSequenceRef.current, tab].slice(-3);
+    tabSequenceRef.current = sequence;
+    if (sequence[0] === 'home' && sequence[1] === 'profile' && sequence[2] === 'saved') {
+      tabSequenceRef.current = [];
+      setShowSyncTermsModal(true);
     }
-
-    return job.photos
-      .map((photo) => ({ photo, items: byPhoto.get(photo.id) ?? [] }))
-      .filter((section) => section.items.length > 0);
-  }, [job]);
-
-  const counts = useMemo(() => {
-    if (!job) return { exact: 0, similar: 0, pending: 0, generic: 0 };
-    return {
-      exact: job.items.filter((item) => item.tier === 'exact').length,
-      similar: job.items.filter((item) => item.tier === 'similar').length,
-      pending: job.items.filter((item) => item.tier === 'pending').length,
-      generic: job.items.filter((item) => item.tier === 'generic').length,
-    };
-  }, [job]);
-
-  const inFlight =
-    status === 'requesting-permission' ||
-    status === 'reading-camera-roll' ||
-    status === 'uploading' ||
-    status === 'analyzing_faces' ||
-    status === 'extracting_clothing';
+  }, []);
 
   const savedHeroCopy = useMemo(() => {
     if (savedTab === 'wishlists') {
@@ -1046,129 +972,6 @@ export default function Index() {
     if (!query) return popularSearches;
     return popularSearches.filter((entry) => entry.label.toLowerCase().includes(query));
   }, [popularSearches, searchText]);
-
-  const renderSyncCard = (showItems: boolean) => (
-    <View style={styles.syncCard}>
-      <View style={styles.syncTitleRow}>
-        <Text style={styles.syncTitle}>Closet sync</Text>
-        <Text style={styles.syncState}>{statusLabel(status)}</Text>
-      </View>
-
-      <Pressable
-        onPress={() => setShowSyncTermsModal(true)}
-        disabled={inFlight}
-        style={({ pressed }) => [
-          styles.syncButton,
-          inFlight || pressed ? styles.syncButtonPressed : null,
-        ]}
-      >
-        {inFlight ? <ActivityIndicator color="#fff" size="small" /> : <Feather name="refresh-cw" size={15} color="#fff" />}
-        <Text style={styles.syncButtonText}>{inFlight ? 'Syncing photos...' : 'Sync camera roll'}</Text>
-      </Pressable>
-
-      {status === 'reading-camera-roll' || status === 'uploading' ? (
-        <Text style={styles.syncMetaText}>
-          {uploadCount.uploaded}/{uploadCount.total} prepared
-        </Text>
-      ) : null}
-
-      {job ? (
-        <View style={styles.syncMetaGroup}>
-          <Text style={styles.syncMetaText}>
-            job {job.id.slice(0, 8)} • {job.photo_count} photos • {job.items.length} items
-          </Text>
-          <Text style={styles.syncMetaText}>
-            {counts.exact} exact • {counts.similar} similar • {counts.pending} pending • {counts.generic} no-match
-          </Text>
-        </View>
-      ) : null}
-
-      {error ? <Text style={styles.errorText}>{error}</Text> : null}
-
-      {showItems && job && status === 'awaiting_face_pick' ? (
-        <View style={styles.clusterPanel}>
-          <Text style={styles.clusterTitle}>Pick your face</Text>
-          <View style={styles.clusterGrid}>
-            {job.clusters.map((cluster) => {
-              const imgStyle = getFaceCropStyle(cluster.rep_bbox, cluster.rep_aspect_ratio);
-              return (
-                <Pressable
-                  key={cluster.id}
-                  onPress={() => chooseCluster(cluster.id)}
-                  disabled={busySelectCluster !== null}
-                  style={({ pressed }) => [
-                    styles.clusterTile,
-                    cluster.id === job.selected_cluster_id ? styles.clusterTileActive : null,
-                    pressed ? styles.clusterTilePressed : null,
-                  ]}
-                >
-                  <View
-                    style={[
-                      styles.clusterFaceCircle,
-                      cluster.id === job.selected_cluster_id ? styles.clusterFaceCircleActive : null,
-                    ]}
-                  >
-                    <Image
-                      source={{ uri: cluster.source_url }}
-                      style={imgStyle}
-                      resizeMode="stretch"
-                    />
-                  </View>
-                  <Text style={styles.clusterCount}>{cluster.member_count} photos</Text>
-                  {busySelectCluster === cluster.id ? <ActivityIndicator size="small" color="#111" /> : null}
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
-      ) : null}
-
-      {showItems && groupedByPhoto.length > 0 ? (
-        <View style={styles.syncedItemsSection}>
-          <Text style={styles.syncedItemsHeading}>Synced closet</Text>
-          <View style={styles.syncedItemsList}>
-            {groupedByPhoto.slice(0, 8).flatMap((section) =>
-              section.items.slice(0, 3).map((item) => (
-                <View key={item.id} style={styles.syncedItemCard}>
-                  <Image
-                    source={{ uri: item.crop_url ?? section.photo.url }}
-                    style={styles.syncedItemImage}
-                  />
-                  <View style={styles.syncedItemTextWrap}>
-                    <Text style={styles.syncedItemBrand} numberOfLines={1}>
-                      {item.brand_visible ?? item.category.toUpperCase()}
-                    </Text>
-                    <Text style={styles.syncedItemTitle} numberOfLines={2}>
-                      {item.description}
-                    </Text>
-                    {item.best_match ? (
-                      <Pressable
-                        onPress={() => {
-                          if (item.best_match?.link) {
-                            Linking.openURL(item.best_match.link).catch(() => {});
-                          }
-                        }}
-                      >
-                        <Text style={styles.bestMatchLink} numberOfLines={1}>
-                          {item.best_match.title}
-                        </Text>
-                      </Pressable>
-                    ) : (
-                      <Text style={styles.bestMatchFallback}>No match yet</Text>
-                    )}
-                  </View>
-                </View>
-              )),
-            )}
-          </View>
-        </View>
-      ) : null}
-
-      {showItems && job && status === 'done' && job.items.length === 0 ? (
-        <Text style={styles.syncMetaText}>No clothing labels were found in this sync run.</Text>
-      ) : null}
-    </View>
-  );
 
   const renderHomeTrendingFeed = () => (
     <View>
@@ -1617,8 +1420,6 @@ export default function Index() {
           {savedItems.length === 0 ? (
             <Text style={styles.syncMetaText}>No saved items returned yet for this session.</Text>
           ) : null}
-
-          {renderSyncCard(true)}
         </View>
       ) : null}
 
@@ -1703,8 +1504,6 @@ export default function Index() {
           <Text style={styles.feedbackButtonText}>Text us</Text>
         </Pressable>
       </View>
-
-      {renderSyncCard(false)}
     </View>
   );
 
@@ -1745,7 +1544,7 @@ export default function Index() {
             {MAIN_TABS.map((tab) => (
               <Pressable
                 key={tab}
-                onPress={() => setActiveTab(tab)}
+                onPress={() => handleMainTabPress(tab)}
                 style={styles.bottomNavItem}
               >
                 {tab === 'home' ? (
@@ -1778,19 +1577,33 @@ export default function Index() {
       >
         <View style={styles.termsBackdrop}>
           <View style={styles.termsCard}>
-            <Text style={styles.termsTitle}>Sync camera roll</Text>
+            <View style={styles.termsHeaderRow}>
+              <View style={styles.termsIconWrap}>
+                <Feather name="refresh-cw" size={16} color="#27272b" />
+              </View>
+              <Text style={[styles.termsTitle, serifStyle()]}>Sync camera roll</Text>
+            </View>
             <Text style={styles.termsBody}>
-              By continuing, phia will request iOS photo permission and upload your {MOST_RECENT_LIMIT} most
-              recent photos to extract clothing insights and personalize your shopping experience.
+              By continuing, phia will request iOS photo permission and upload recent photos to
+              extract clothing insights and personalize your shopping experience.
             </Text>
             <Text style={styles.termsFootnote}>You can revoke photo access any time in iOS Settings.</Text>
 
             <View style={styles.termsButtonRow}>
-              <Pressable style={styles.termsSecondaryButton} onPress={() => setShowSyncTermsModal(false)}>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.termsSecondaryButton,
+                  pressed ? styles.termsSecondaryButtonPressed : null,
+                ]}
+                onPress={() => setShowSyncTermsModal(false)}
+              >
                 <Text style={styles.termsSecondaryButtonText}>Not now</Text>
               </Pressable>
               <Pressable
-                style={styles.termsPrimaryButton}
+                style={({ pressed }) => [
+                  styles.termsPrimaryButton,
+                  pressed ? styles.termsPrimaryButtonPressed : null,
+                ]}
                 onPress={() => {
                   setShowSyncTermsModal(false);
                   void syncCameraRoll();
@@ -2667,65 +2480,89 @@ const styles = StyleSheet.create({
   },
   termsBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.48)',
+    backgroundColor: 'rgba(15,15,18,0.4)',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 20,
   },
   termsCard: {
     width: '100%',
-    maxWidth: 420,
-    borderRadius: 16,
-    backgroundColor: '#fff',
-    paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 14,
+    maxWidth: 430,
+    borderRadius: 24,
+    backgroundColor: '#f7f7f9',
+    borderWidth: 1,
+    borderColor: '#e1e2e7',
+    paddingHorizontal: 18,
+    paddingTop: 18,
+    paddingBottom: 16,
+    gap: 12,
+  },
+  termsHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
     gap: 10,
   },
+  termsIconWrap: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#ececf0',
+  },
   termsTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#121212',
+    fontSize: 22,
+    color: '#111',
+    letterSpacing: -0.35,
   },
   termsBody: {
-    fontSize: 14,
-    lineHeight: 21,
-    color: '#2f2f34',
+    fontSize: 14.5,
+    lineHeight: 22,
+    color: '#2f2f36',
   },
   termsFootnote: {
     fontSize: 12,
-    color: '#6d6d74',
+    color: '#6a6a72',
   },
   termsButtonRow: {
-    marginTop: 4,
+    marginTop: 6,
     flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
+    justifyContent: 'space-between',
+    gap: 8,
   },
   termsSecondaryButton: {
-    height: 38,
-    borderRadius: 10,
+    flex: 1,
+    height: 42,
+    borderRadius: 999,
     borderWidth: 1,
-    borderColor: '#d7d7db',
-    paddingHorizontal: 14,
+    borderColor: '#d8d9df',
+    backgroundColor: '#f2f2f5',
     justifyContent: 'center',
+    alignItems: 'center',
   },
   termsSecondaryButtonText: {
-    color: '#36363a',
-    fontSize: 13,
+    color: '#36363d',
+    fontSize: 13.5,
     fontWeight: '600',
   },
+  termsSecondaryButtonPressed: {
+    opacity: 0.75,
+  },
   termsPrimaryButton: {
-    height: 38,
-    borderRadius: 10,
+    flex: 1,
+    height: 42,
+    borderRadius: 999,
     backgroundColor: '#111',
-    paddingHorizontal: 16,
     justifyContent: 'center',
+    alignItems: 'center',
   },
   termsPrimaryButtonText: {
     color: '#fff',
-    fontSize: 13,
+    fontSize: 13.5,
     fontWeight: '700',
+  },
+  termsPrimaryButtonPressed: {
+    opacity: 0.85,
   },
   syncMetaText: {
     color: '#67676c',

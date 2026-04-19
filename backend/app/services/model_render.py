@@ -146,10 +146,19 @@ def auto_generate_for_photo(
     selection_reason = str(selection.get("reason") or "").strip()
     selected_box = ranked_candidates[selected_index]
 
+    # Relaxed fallback: majority of body visible is enough even when head-to-toe
+    # isn't fully present in frame.
+    if not body_visible and _is_majority_body_visible(source_image, selected_box):
+        body_visible = True
+        if selection_reason:
+            selection_reason = f"{selection_reason} (accepted by relaxed majority-body visibility rule)"
+        else:
+            selection_reason = "Accepted by relaxed majority-body visibility rule"
+
     if not body_visible:
         return {
             "status": "skipped",
-            "skip_reason": selection_reason or "Target person's full body is not visible enough",
+            "skip_reason": selection_reason or "Target person's body visibility is too limited",
             "selected_person_crop_path": None,
             "selected_person_bbox": {
                 "x1": int(selected_box[0]),
@@ -417,6 +426,22 @@ def _crop_with_pad(
     return image.crop((cx1, cy1, cx2, cy2))
 
 
+def _is_majority_body_visible(
+    image: Image.Image,
+    bbox_xyxy: tuple[int, int, int, int],
+) -> bool:
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return False
+    x1, y1, x2, y2 = bbox_xyxy
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    height_ratio = box_h / float(height)
+    area_ratio = (box_w * box_h) / float(width * height)
+    # Majority-visible threshold: substantial person region, not necessarily full head-to-toe.
+    return height_ratio >= 0.55 and area_ratio >= 0.12
+
+
 def _select_target_person_with_gpt(
     *,
     settings: Settings,
@@ -447,7 +472,9 @@ def _select_target_person_with_gpt(
             "text": (
                 "You are selecting the target person from person detections in a fashion photo.\n"
                 "Pick the person that best matches the target face image.\n"
-                "Then decide if that selected person's FULL BODY is visible enough for realistic model generation.\n"
+                "Then decide if that selected person's MAJORITY OF BODY is visible enough for realistic model generation.\n"
+                "Head-to-toe visibility is NOT required. It's okay if feet or some lower leg is cropped.\n"
+                "Set is_body_visible=true when most of the torso/upper body and a substantial portion of lower body are visible.\n"
                 "Return strict JSON with selected_index, is_body_visible, and reason.\n"
                 "Person boxes:\n"
                 + "\n".join(bbox_lines)
