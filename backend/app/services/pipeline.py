@@ -15,7 +15,7 @@ import requests
 from PIL import Image
 
 from app.core.config import Settings
-from app.services import db
+from app.services import db, phia
 
 try:
     import boto3  # type: ignore
@@ -83,6 +83,7 @@ YOLO_WORLD_CLASS_NAMES: list[str] = [
 _RUNNING_FACE_JOBS: set[str] = set()
 _RUNNING_CLOTHING_RUNS: set[str] = set()
 _RUNNING_LOOKUPS: set[str] = set()
+_RUNNING_STYLING_AUTO_RUNS: set[str] = set()
 _RUN_LOCK = threading.Lock()
 _SUPABASE_UPLOAD_LOCK = threading.Lock()
 _UPLOADED_SUPABASE_MEDIA: set[str] = set()
@@ -99,6 +100,7 @@ def configure(settings: Settings) -> None:
     (settings.media_dir / "photos").mkdir(parents=True, exist_ok=True)
     (settings.media_dir / "face_tiles").mkdir(parents=True, exist_ok=True)
     (settings.media_dir / "clothing_crops").mkdir(parents=True, exist_ok=True)
+    (settings.media_dir / "styling_person_crops").mkdir(parents=True, exist_ok=True)
 
 
 def _settings() -> Settings:
@@ -208,6 +210,39 @@ def _debug_patch(job_id: str, patch: dict[str, Any] | None = None, event: dict[s
         pass
 
 
+def _normalize_best_match(
+    raw: Any,
+    *,
+    fallback_confidence: Any,
+    fallback_tier: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    tier = str(raw.get("source_tier") or fallback_tier or "").strip().lower()
+    if tier not in {"exact", "similar"}:
+        tier = "exact" if str(fallback_tier or "").strip().lower() == "exact" else "similar"
+
+    try:
+        confidence = float(raw.get("confidence"))
+    except Exception:
+        try:
+            confidence = float(fallback_confidence or 0)
+        except Exception:
+            confidence = 0.0
+
+    return {
+        "title": str(raw.get("title") or ""),
+        "source": str(raw.get("source") or ""),
+        "price": raw.get("price"),
+        "link": str(raw.get("link") or ""),
+        "thumbnail": str(raw.get("thumbnail") or ""),
+        "confidence": confidence,
+        "reasoning": str(raw.get("reasoning") or ""),
+        "source_tier": tier,
+    }
+
+
 def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
     job = db.get_job(job_id)
     if not job:
@@ -227,6 +262,11 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
             "url": media_rel_to_url(media_base_url, p["relative_path"]),
             "width": p["width"],
             "height": p["height"],
+            "captured_at": p.get("captured_at"),
+            "captured_at_epoch_ms": p.get("captured_at_epoch_ms"),
+            "latitude": p.get("latitude"),
+            "longitude": p.get("longitude"),
+            "location_source": p.get("location_source"),
         }
         for p in photos
     ]
@@ -278,7 +318,11 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
             "exact_matches": i["exact_matches"],
             "similar_products": i["similar_products"],
             "phia_products": i.get("phia_products") or [],
-            "best_match": i.get("best_match"),
+            "best_match": _normalize_best_match(
+                i.get("best_match"),
+                fallback_confidence=i.get("best_match_confidence"),
+                fallback_tier=i.get("tier"),
+            ),
             "best_match_confidence": i.get("best_match_confidence") or 0,
         }
         for i in items
@@ -292,6 +336,107 @@ def build_job_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
         "clusters": clusters_out,
         "items": items_out,
         "debug": debug,
+    }
+
+
+def build_styling_auto_runs_detail(job_id: str, media_base_url: str) -> dict[str, Any] | None:
+    job = db.get_job(job_id)
+    if not job:
+        return None
+
+    photos = db.list_photos(job_id)
+    runs = db.list_styling_auto_runs(job_id)
+    run_by_photo = {row["photo_id"]: row for row in runs}
+
+    rows: list[dict[str, Any]] = []
+    for photo in photos:
+        photo_id = str(photo["id"])
+        source_photo_path = str(photo.get("relative_path") or "")
+        source_photo_url = media_rel_to_url(media_base_url, source_photo_path) if source_photo_path else ""
+
+        run = run_by_photo.get(photo_id)
+        if run is None:
+            face_rel = f"face_tiles/{job_id}/{photo_id}.jpg"
+            face_abs = _settings().media_dir / face_rel
+            rows.append(
+                {
+                    "photo_id": photo_id,
+                    "status": "waiting",
+                    "source_photo_url": source_photo_url,
+                    "face_crop_url": media_rel_to_url(media_base_url, face_rel) if face_abs.exists() else None,
+                    "selected_person_crop_url": None,
+                    "selected_person_bbox": None,
+                    "gpt_selected_index": None,
+                    "gpt_selection_reason": "",
+                    "body_visible": None,
+                    "prompt": "",
+                    "render_id": None,
+                    "best_variant_index": None,
+                    "best_reason": "",
+                    "skip_reason": "",
+                    "error": "",
+                    "variants": [],
+                    "created_at": None,
+                    "started_at": None,
+                    "finished_at": None,
+                    "updated_at": None,
+                }
+            )
+            continue
+
+        run_id = str(run["id"])
+        variants_raw = db.list_styling_auto_variants(run_id)
+        variants = [
+            {
+                "variant_index": int(v.get("variant_index") or 0),
+                "prompt": str(v.get("prompt") or ""),
+                "output_url": media_rel_to_url(media_base_url, str(v.get("output_path") or "")),
+                "realism": v.get("realism"),
+                "aesthetic": v.get("aesthetic"),
+                "overall": v.get("overall"),
+                "justification": str(v.get("justification") or ""),
+                "is_best": bool(v.get("is_best")),
+            }
+            for v in variants_raw
+        ]
+        selected_person_crop_path = str(run.get("selected_person_crop_path") or "")
+        face_crop_path = str(run.get("face_crop_path") or "")
+        rows.append(
+            {
+                "photo_id": photo_id,
+                "status": str(run.get("status") or "waiting"),
+                "source_photo_url": source_photo_url,
+                "face_crop_url": media_rel_to_url(media_base_url, face_crop_path) if face_crop_path else None,
+                "selected_person_crop_url": (
+                    media_rel_to_url(media_base_url, selected_person_crop_path)
+                    if selected_person_crop_path
+                    else None
+                ),
+                "selected_person_bbox": run.get("selected_person_bbox"),
+                "gpt_selected_index": run.get("gpt_selected_index"),
+                "gpt_selection_reason": str(run.get("gpt_selection_reason") or ""),
+                "body_visible": (
+                    None
+                    if run.get("body_visible") is None
+                    else bool(int(run.get("body_visible")))
+                ),
+                "prompt": str(run.get("prompt") or ""),
+                "render_id": run.get("render_id"),
+                "best_variant_index": run.get("best_variant_index"),
+                "best_reason": str(run.get("best_reason") or ""),
+                "skip_reason": str(run.get("skip_reason") or ""),
+                "error": str(run.get("error") or ""),
+                "variants": variants,
+                "created_at": run.get("created_at"),
+                "started_at": run.get("started_at"),
+                "finished_at": run.get("finished_at"),
+                "updated_at": run.get("updated_at"),
+            }
+        )
+
+    return {
+        "job_id": job_id,
+        "runs": rows,
     }
 
 
@@ -347,6 +492,49 @@ def start_lookup_item(item_id: str) -> None:
                 _RUNNING_LOOKUPS.discard(item_id)
 
     threading.Thread(target=runner, name=f"lookup-{item_id[:8]}", daemon=True).start()
+
+
+def start_styling_auto_run(
+    *,
+    job_id: str,
+    photo_id: str,
+    trigger_item_id: str | None = None,
+) -> None:
+    photo = db.get_photo(photo_id)
+    if not photo:
+        return
+
+    source_photo_path = str(photo.get("relative_path") or "").strip()
+    if not source_photo_path:
+        return
+    face_crop_rel = f"face_tiles/{job_id}/{photo_id}.jpg"
+    face_crop_abs = _settings().media_dir / face_crop_rel
+    face_crop_path = face_crop_rel if face_crop_abs.exists() else None
+
+    claimed = db.claim_styling_auto_run(
+        job_id=job_id,
+        photo_id=photo_id,
+        source_photo_path=source_photo_path,
+        face_crop_path=face_crop_path,
+        trigger_item_id=trigger_item_id,
+    )
+    if not bool(claimed.get("is_new")):
+        return
+
+    run_id = str(claimed["id"])
+    with _RUN_LOCK:
+        if run_id in _RUNNING_STYLING_AUTO_RUNS:
+            return
+        _RUNNING_STYLING_AUTO_RUNS.add(run_id)
+
+    def runner() -> None:
+        try:
+            _run_styling_auto_worker(run_id)
+        finally:
+            with _RUN_LOCK:
+                _RUNNING_STYLING_AUTO_RUNS.discard(run_id)
+
+    threading.Thread(target=runner, name=f"style-auto-{run_id[:8]}", daemon=True).start()
 
 
 def _analyze_faces_worker(job_id: str, *, user_name: str | None = None) -> None:
@@ -1542,6 +1730,32 @@ def _lookup_item_worker(item_id: str) -> None:
                             best_confidence = float(ranked.get("confidence") or 0)
                             final_tier = "exact" if ranked.get("tier") == "exact" else "similar"
 
+        # Fallback: if we picked a best match but it has no link, try Phia's
+        # ProductsGoogleShoppingApi using the crop image URL.
+        if best_match and not str(best_match.get("link") or "").strip():
+            fallback_name = str(best_match.get("title") or item.get("description") or "").strip()
+            phia_products = _find_phia_products_for_fallback(
+                scraped_name=fallback_name,
+                crop_external_url=crop_external_url,
+            )
+            if phia_products:
+                top = phia_products[0]
+                product_url = str(top.get("product_url") or "").strip()
+                if product_url:
+                    best_match["link"] = product_url
+                if not str(best_match.get("thumbnail") or "").strip():
+                    best_match["thumbnail"] = str(top.get("img_url") or "")
+                if not str(best_match.get("source") or "").strip():
+                    best_match["source"] = (
+                        str(top.get("source_display_name") or "")
+                        or str(top.get("primary_brand_name") or "")
+                        or "Phia"
+                    )
+                if not best_match.get("price"):
+                    price_usd = top.get("price_usd")
+                    if isinstance(price_usd, (int, float)):
+                        best_match["price"] = f"${float(price_usd):.2f}"
+
         if final_tier == "pending":
             final_tier = "generic"
 
@@ -1555,8 +1769,197 @@ def _lookup_item_worker(item_id: str) -> None:
             best_match_confidence=best_confidence,
             crop_path=crop_rel,
         )
+
+        if _photo_has_any_best_match_link(item["photo_id"]):
+            start_styling_auto_run(
+                job_id=item["job_id"],
+                photo_id=item["photo_id"],
+                trigger_item_id=item_id,
+            )
     except Exception as exc:  # pragma: no cover
         print(TAG, "lookup failed", item_id, exc)
+
+
+def _photo_has_any_best_match_link(photo_id: str) -> bool:
+    items = db.list_clothing_items_for_photo(photo_id)
+    for item in items:
+        best = item.get("best_match")
+        if isinstance(best, dict):
+            link = str(best.get("link") or "").strip()
+            if link:
+                return True
+    return False
+
+
+def _detect_person_boxes_for_styling(source_photo_relative_path: str) -> tuple[list[tuple[int, int, int, int]], dict[str, Any]]:
+    debug: dict[str, Any] = {}
+    external_photo_url = _external_media_url(source_photo_relative_path)
+    if not external_photo_url:
+        debug["status"] = "failed"
+        debug["error"] = "missing_external_photo_url"
+        return [], debug
+
+    detections = _detect_objects(
+        external_photo_url,
+        class_names=["person"],
+        debug=debug,
+    )
+    boxes: list[tuple[int, int, int, int]] = []
+    for det in detections:
+        raw_bbox = det.get("bbox") or []
+        if not isinstance(raw_bbox, list) or len(raw_bbox) < 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in raw_bbox[:4]]
+        except Exception:
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        boxes.append((x1, y1, x2, y2))
+    return boxes, debug
+
+
+def _run_styling_auto_worker(run_id: str) -> None:
+    run = db.get_styling_auto_run(run_id)
+    if not run:
+        return
+    job_id = str(run["job_id"])
+    photo_id = str(run["photo_id"])
+    db.update_styling_auto_run(
+        run_id,
+        status="running",
+        started_at=db.utc_now_iso(),
+        error=None,
+        skip_reason=None,
+    )
+    _debug_patch(
+        job_id,
+        event={
+            "type": "styling_auto_started",
+            "message": "Automatic styling generation started",
+            "data": {"photo_id": photo_id, "run_id": run_id},
+        },
+    )
+
+    try:
+        from app.services import model_render
+
+        person_boxes, yolo_debug = _detect_person_boxes_for_styling(str(run["source_photo_path"]))
+        _debug_patch(
+            job_id,
+            event={
+                "type": "styling_auto_person_detection",
+                "message": "Ran YOLO-World person detection for styling auto-run",
+                "data": {
+                    "photo_id": photo_id,
+                    "run_id": run_id,
+                    "person_box_count": len(person_boxes),
+                    "yolo_debug": yolo_debug,
+                },
+            },
+        )
+
+        result = model_render.auto_generate_for_photo(
+            settings=_settings(),
+            job_id=job_id,
+            photo_id=photo_id,
+            source_photo_relative_path=str(run["source_photo_path"]),
+            face_crop_relative_path=(
+                str(run.get("face_crop_path"))
+                if run.get("face_crop_path") is not None
+                else None
+            ),
+            person_boxes=person_boxes,
+        )
+
+        if str(result.get("status") or "") == "skipped":
+            db.update_styling_auto_run(
+                run_id,
+                status="skipped",
+                selected_person_crop_path=result.get("selected_person_crop_path"),
+                selected_person_bbox=result.get("selected_person_bbox"),
+                gpt_selected_index=result.get("gpt_selected_index"),
+                gpt_selection_reason=result.get("gpt_selection_reason"),
+                body_visible=result.get("body_visible"),
+                skip_reason=result.get("skip_reason"),
+                finished_at=db.utc_now_iso(),
+                error=None,
+            )
+            _debug_patch(
+                job_id,
+                event={
+                    "type": "styling_auto_skipped",
+                    "message": "Automatic styling generation skipped",
+                    "data": {"photo_id": photo_id, "run_id": run_id},
+                },
+            )
+            return
+
+        db.update_styling_auto_run(
+            run_id,
+            status="completed",
+            selected_person_crop_path=result.get("selected_person_crop_path"),
+            selected_person_bbox=result.get("selected_person_bbox"),
+            gpt_selected_index=result.get("gpt_selected_index"),
+            gpt_selection_reason=result.get("gpt_selection_reason"),
+            body_visible=result.get("body_visible"),
+            prompt=result.get("prompt"),
+            render_id=result.get("render_id"),
+            best_variant_index=result.get("best_variant_index"),
+            best_reason=result.get("best_reason"),
+            finished_at=db.utc_now_iso(),
+            error=None,
+            skip_reason=None,
+        )
+        db.replace_styling_auto_variants(
+            run_id,
+            variants=result.get("variants") or [],
+            best_variant_index=result.get("best_variant_index"),
+        )
+        _debug_patch(
+            job_id,
+            event={
+                "type": "styling_auto_complete",
+                "message": "Automatic styling generation completed",
+                "data": {
+                    "photo_id": photo_id,
+                    "run_id": run_id,
+                    "render_id": result.get("render_id"),
+                    "best_variant_index": result.get("best_variant_index"),
+                },
+            },
+        )
+    except Exception as exc:
+        skip_reason = ""
+        status = "failed"
+        try:
+            from app.services import model_render
+
+            if isinstance(exc, model_render.AutoStylingSkip):
+                status = "skipped"
+                skip_reason = str(exc) or "Target person body not visible enough"
+        except Exception:
+            pass
+
+        db.update_styling_auto_run(
+            run_id,
+            status=status,
+            finished_at=db.utc_now_iso(),
+            error=None if status == "skipped" else str(exc),
+            skip_reason=skip_reason if status == "skipped" else None,
+        )
+        _debug_patch(
+            job_id,
+            event={
+                "type": "styling_auto_failed" if status == "failed" else "styling_auto_skipped",
+                "message": (
+                    f"Automatic styling generation failed: {exc}"
+                    if status == "failed"
+                    else "Automatic styling generation skipped"
+                ),
+                "data": {"photo_id": photo_id, "run_id": run_id},
+            },
+        )
 
 
 def refresh_item_lookup(item_id: str) -> None:
@@ -1898,6 +2301,9 @@ def _extract_items_from_detections_with_openai(
         "5) For duplicate boxes of the same item, keep the nearest one to the target and reject the others.\n"
         "6) For accessories, especially bracelets/wristbands: if crop is tiny, blurry, or not visually recognizable, set crop_quality='bad' so it is removed.\n"
         "7) Keep only useful crops for downstream shopping lookup.\n"
+        "8) `description` must be a short keyword search label (2-6 words) optimized for shopping lookup.\n"
+        "9) Do NOT write sentences or context like 'worn by the target person'.\n"
+        "10) Example good descriptions: 'navy quarter zip', 'black leather belt', 'white running shoes'.\n"
         f"Target hint: {face_desc}\n"
         "Detections (in order):\n"
         + "\n".join(detection_lines)
@@ -1984,9 +2390,10 @@ def _extract_items_from_detections_with_openai(
         box_center_y = float(bbox["y"]) + float(bbox["h"]) / 2.0
         distance_to_target = ((box_center_x - face_center_x) ** 2 + (box_center_y - face_center_y) ** 2) ** 0.5
         detector_label = str(det.get("label") or "").strip().lower()
-        description = str(item.get("description") or "").strip()
-        if not description:
-            description = detector_label or "Detected clothing item"
+        description = _compact_search_description(
+            str(item.get("description") or ""),
+            fallback=detector_label or "detected clothing item",
+        )
         category = description
 
         visibility = str(item.get("visibility") or "clear")
@@ -2035,6 +2442,28 @@ def _extract_items_from_detections_with_openai(
         cleaned.pop("_distance_to_target", None)
         out.append(cleaned)
     return out
+
+
+def _compact_search_description(raw: str, *, fallback: str) -> str:
+    text = str(raw or "").strip().lower().replace("-", " ")
+    text = re.sub(r"\bquarter\s+zip\s+pullover\b", "quarter zip", text)
+    text = re.sub(r"\bworn by (the )?target person\b", " ", text)
+    text = re.sub(r"\btarget person\b", " ", text)
+    text = re.sub(r"\bworn by\b", " ", text)
+    text = re.sub(r"\bwearing\b", " ", text)
+    text = re.sub(r"\bworn\b", " ", text)
+    text = re.sub(r"\bthe wearer\b", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    words = [w for w in re.split(r"\s+", text) if w]
+    stop = {"the", "a", "an", "for", "of", "on", "with", "in", "to", "by", "this", "that"}
+    words = [w for w in words if w not in stop]
+    if not words:
+        fb = str(fallback or "").strip().lower().replace("-", " ")
+        fb = re.sub(r"[^a-z0-9\s]", " ", fb)
+        words = [w for w in re.split(r"\s+", fb) if w]
+    if len(words) > 6:
+        words = words[:6]
+    return " ".join(words) if words else "clothing item"
 
 
 def _detection_bbox_to_xywh(bbox: list[float], img_w: int, img_h: int) -> dict[str, float]:
@@ -2352,16 +2781,44 @@ def _find_similar_products(description: str) -> list[dict[str, Any]]:
         results = data.get("shopping_results") or []
         out: list[dict[str, Any]] = []
         for result in results[:3]:
+            link = (
+                result.get("link")
+                or result.get("product_link")
+                or result.get("serpapi_product_api")
+                or ""
+            )
+            thumbnail = result.get("thumbnail") or result.get("serpapi_thumbnail") or ""
             out.append(
                 {
                     "title": result.get("title") or "",
                     "source": result.get("source") or "",
                     "price": result.get("price") or None,
-                    "link": result.get("link") or "",
-                    "thumbnail": result.get("thumbnail") or "",
+                    "link": link,
+                    "thumbnail": thumbnail,
                 }
             )
         return out
+    except Exception:
+        return []
+
+
+def _find_phia_products_for_fallback(
+    *,
+    scraped_name: str,
+    crop_external_url: str | None = None,
+) -> list[dict[str, Any]]:
+    settings = _settings()
+    cleaned_name = str(scraped_name or "").strip()
+    cleaned_url = str(crop_external_url or "").strip()
+    if not cleaned_name and not cleaned_url:
+        return []
+    try:
+        return phia.products_google_shopping(
+            settings=settings,
+            scraped_name=cleaned_name,
+            image_urls=[cleaned_url] if cleaned_url else None,
+            limit=3,
+        )
     except Exception:
         return []
 

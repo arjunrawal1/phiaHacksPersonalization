@@ -40,6 +40,11 @@ interface PhotoOut {
   url: string;
   width: number | null;
   height: number | null;
+  captured_at?: string | null;
+  captured_at_epoch_ms?: number | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  location_source?: string | null;
 }
 
 interface FaceClusterOut {
@@ -131,13 +136,98 @@ interface SearchBrandTile {
   image: string;
 }
 
-const MOST_RECENT_LIMIT = 10;
+interface ForYouProductCard {
+  id: string;
+  title: string;
+  priceLabel: string;
+  image: string;
+}
+
+interface ExploreTile {
+  id: string;
+  title: string;
+  subtitle: string;
+  image: string;
+}
+
+interface FeedCurrentUser {
+  firstName?: string | null;
+  lastName?: string | null;
+  username?: string | null;
+}
+
+interface FeedCampaign {
+  name?: string | null;
+}
+
+interface FeedNotifications {
+  notification_count?: number;
+  price_drop_alert_count?: number;
+}
+
+interface FeedTopTrend {
+  id: string;
+  title?: string | null;
+  image_url?: string | null;
+}
+
+interface FeedTrendingProduct {
+  id: string;
+  brand?: string | null;
+  name?: string | null;
+  view_count?: number | null;
+  image_url?: string | null;
+  price?: string | null;
+}
+
+interface FeedTrendingBrand {
+  id: string;
+  name?: string | null;
+  visit_count?: number | null;
+}
+
+interface FeedPopularSearch {
+  id: string;
+  label?: string | null;
+  image_url?: string | null;
+}
+
+interface FeedSearchBrand {
+  id: string;
+  name?: string | null;
+  image_url?: string | null;
+}
+
+interface FeedSavedItem {
+  id: string;
+  name?: string | null;
+  brand?: string | null;
+  image_url?: string | null;
+  price_usd?: string | null;
+}
+
+interface FeedResponse {
+  errors?: string[];
+  current_user?: FeedCurrentUser | null;
+  active_campaign?: FeedCampaign | null;
+  notifications?: FeedNotifications | null;
+  top_trends?: FeedTopTrend[];
+  trending_products?: FeedTrendingProduct[];
+  trending_brands?: FeedTrendingBrand[];
+  popular_searches?: FeedPopularSearch[];
+  search_brands?: FeedSearchBrand[];
+  saved_items?: FeedSavedItem[];
+}
+
+const MOST_RECENT_LIMIT = 25;
 const POLL_MS = 1500;
 const MAX_DIMENSION = 1920;
 const FACE_PICKER_CIRCLE_SIZE = 72;
-const CURRENT_USER_NAME = 'arjun rawal';
+const DEFAULT_USER_NAME = 'arjun rawal';
+const FALLBACK_PRODUCT_IMAGE =
+  'https://images.unsplash.com/photo-1512436991641-6745cdb1723f?auto=format&fit=crop&w=900&q=80';
 
-const HERO_CARDS: HeroCard[] = [
+const FALLBACK_HERO_CARDS: HeroCard[] = [
   {
     id: 'hero-1',
     title: "Men's Workwear Basics",
@@ -158,7 +248,7 @@ const HERO_CARDS: HeroCard[] = [
   },
 ];
 
-const TRENDING_PRODUCTS: TrendingProduct[] = [
+const FALLBACK_TRENDING_PRODUCTS: TrendingProduct[] = [
   {
     id: 'product-1',
     brand: 'EVERLANE',
@@ -177,13 +267,13 @@ const TRENDING_PRODUCTS: TrendingProduct[] = [
   },
 ];
 
-const TRENDING_BRANDS = [
+const FALLBACK_TRENDING_BRANDS = [
   { id: 'brand-1', rank: '#1', label: 'REVOLVE', visits: '47.93K visits' },
   { id: 'brand-2', rank: '#2', label: 'NORDSTROM', visits: '29.98K visits' },
   { id: 'brand-3', rank: '#3', label: 'TheRealReal', visits: '27.83K visits' },
 ];
 
-const POPULAR_SEARCHES: PopularSearch[] = [
+const FALLBACK_POPULAR_SEARCHES: PopularSearch[] = [
   {
     id: 'search-1',
     label: 'Tb.490 Rife Shimmer Silver Sneakers',
@@ -216,7 +306,7 @@ const POPULAR_SEARCHES: PopularSearch[] = [
   },
 ];
 
-const BRAND_SUGGESTIONS: BrandSuggestion[] = [
+const FALLBACK_BRAND_SUGGESTIONS: BrandSuggestion[] = [
   {
     id: 'suggested-brand-1',
     label: 'MANGO',
@@ -253,7 +343,7 @@ const SEARCH_SHORTCUTS: SearchShortcut[] = [
   { id: 'shortcut-luxury', label: 'Luxury', icon: 'star' },
 ];
 
-const SEARCH_BRAND_TILES: SearchBrandTile[] = [
+const FALLBACK_SEARCH_BRAND_TILES: SearchBrandTile[] = [
   {
     id: 'search-brand-mango',
     label: 'MANGO',
@@ -280,25 +370,25 @@ const SEARCH_BRAND_TILES: SearchBrandTile[] = [
   },
 ];
 
-const FOR_YOU_SPORT_PRODUCTS = [
+const FALLBACK_FOR_YOU_PRODUCTS: ForYouProductCard[] = [
   {
     id: 'sport-1',
     title: 'Nike Tech Zip Hoodie',
-    price: '$79',
+    priceLabel: '$79',
     image:
       'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?auto=format&fit=crop&w=900&q=80',
   },
   {
     id: 'sport-2',
     title: 'Nike Running Shorts',
-    price: '$25',
+    priceLabel: '$25',
     image:
       'https://images.unsplash.com/photo-1617952236317-7f5b9db59adb?auto=format&fit=crop&w=900&q=80',
   },
   {
     id: 'sport-3',
     title: 'Performance Track Set',
-    price: '$88',
+    priceLabel: '$88',
     image:
       'https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?auto=format&fit=crop&w=900&q=80',
   },
@@ -322,6 +412,11 @@ function backendBaseUrl(): string {
 }
 
 const BACKEND = backendBaseUrl();
+const SIM_PHIA_ID = (process.env.EXPO_PUBLIC_SIM_PHIA_ID ?? '').trim();
+const SIM_PHIA_SESSION = (process.env.EXPO_PUBLIC_SIM_PHIA_SESSION ?? '').trim();
+const SIM_PHIA_BEARER = (process.env.EXPO_PUBLIC_SIM_PHIA_BEARER ?? '').trim();
+const SIM_PHIA_PLATFORM = (process.env.EXPO_PUBLIC_SIM_PHIA_PLATFORM ?? '').trim();
+const SIM_PHIA_PLATFORM_VERSION = (process.env.EXPO_PUBLIC_SIM_PHIA_PLATFORM_VERSION ?? '').trim();
 
 function statusLabel(status: SyncStatus): string {
   switch (status) {
@@ -353,6 +448,44 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(text || `${res.status}`);
   }
   return (await res.json()) as T;
+}
+
+function formatVisitCount(value: number | null | undefined): string {
+  if (!value || value <= 0) return 'New';
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M visits`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K visits`;
+  return `${value} visits`;
+}
+
+function initialsForName(name: string): string {
+  const parts = name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) return 'PH';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+}
+
+function formatPriceLabel(raw: string | null | undefined, fallback: string): string {
+  const value = (raw ?? '').trim();
+  if (!value) return fallback;
+  return value.startsWith('$') ? value : `$${value}`;
+}
+
+function normalizeEpochMs(value: number | null | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  const rounded = Math.round(value);
+  return rounded < 100_000_000_000 ? rounded * 1000 : rounded;
+}
+
+function isoFromEpochMs(value: number | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new Date(value).toISOString();
+  } catch {
+    return null;
+  }
 }
 
 async function preprocessAssetUri(
@@ -429,12 +562,24 @@ export default function Index() {
   const [searchFocused, setSearchFocused] = useState(false);
   const [homeFeedTab, setHomeFeedTab] = useState<HomeFeedTab>('trending');
   const [showSyncTermsModal, setShowSyncTermsModal] = useState(false);
+  const [feedData, setFeedData] = useState<FeedResponse | null>(null);
+  const [feedError, setFeedError] = useState<string | null>(null);
   const [bottomNavTrackWidth, setBottomNavTrackWidth] = useState(0);
   const bottomNavHighlightX = useRef(new Animated.Value(0)).current;
   const searchInputRef = useRef<TextInput | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const bottomTabWidth = bottomNavTrackWidth > 0 ? bottomNavTrackWidth / MAIN_TABS.length : 0;
+  const userNameForSync = useMemo(() => {
+    const user = feedData?.current_user;
+    const first = (user?.firstName ?? '').trim();
+    const last = (user?.lastName ?? '').trim();
+    const username = (user?.username ?? '').trim();
+    const full = `${first} ${last}`.trim();
+    if (full) return full;
+    if (username) return username;
+    return DEFAULT_USER_NAME;
+  }, [feedData]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -503,6 +648,41 @@ export default function Index() {
     return () => clearTimeout(timer);
   }, [searchFocused]);
 
+  const loadFeed = useCallback(async () => {
+    try {
+      const useSimulatedSession = Boolean(SIM_PHIA_ID && SIM_PHIA_SESSION);
+      const feed = useSimulatedSession
+        ? await fetchJson<FeedResponse>('/api/phia/mobile-feed/simulate-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              auth: {
+                phia_id: SIM_PHIA_ID,
+                session_cookie: SIM_PHIA_SESSION,
+                bearer_token: SIM_PHIA_BEARER || undefined,
+                platform: SIM_PHIA_PLATFORM || undefined,
+                platform_version: SIM_PHIA_PLATFORM_VERSION || undefined,
+              },
+              inherit_default_auth: true,
+              explore_feed_input: {},
+            }),
+          })
+        : await fetchJson<FeedResponse>('/api/phia/mobile-feed');
+      setFeedData(feed);
+      if (feed.errors && feed.errors.length > 0) {
+        setFeedError(feed.errors[0]);
+      } else {
+        setFeedError(null);
+      }
+    } catch (e) {
+      setFeedError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadFeed();
+  }, [loadFeed]);
+
   const syncCameraRoll = useCallback(async () => {
     try {
       setError(null);
@@ -535,7 +715,7 @@ export default function Index() {
 
       setStatus('uploading');
       const form = new FormData();
-      form.append('user_name', CURRENT_USER_NAME);
+      form.append('user_name', userNameForSync);
       let uploaded = 0;
       for (let i = 0; i < assetsToUpload.length; i += 1) {
         const asset = assetsToUpload[i];
@@ -544,11 +724,29 @@ export default function Index() {
         const uri = await preprocessAssetUri(local, asset.width ?? 0, asset.height ?? 0);
         if (!uri) continue;
 
+        const capturedAtEpochMs = normalizeEpochMs(
+          asset.creationTime ?? ((info as any)?.creationTime as number | undefined),
+        );
+        const latitude =
+          typeof info.location?.latitude === 'number' ? info.location.latitude : null;
+        const longitude =
+          typeof info.location?.longitude === 'number' ? info.location.longitude : null;
+        const metadata = {
+          asset_id: asset.id ?? null,
+          captured_at_epoch_ms: capturedAtEpochMs,
+          captured_at_iso: isoFromEpochMs(capturedAtEpochMs),
+          location:
+            latitude != null && longitude != null ? { latitude, longitude } : null,
+          location_source:
+            latitude != null && longitude != null ? 'media_library' : null,
+        };
+
         form.append('photos', {
           uri,
           name: `${asset.id || `latest-photo-${i + 1}`}.jpg`,
           type: 'image/jpeg',
         } as any);
+        form.append('photo_metadata', JSON.stringify(metadata));
         uploaded += 1;
         setUploadCount({ total: assetsToUpload.length, uploaded });
       }
@@ -573,7 +771,7 @@ export default function Index() {
       setStatus('failed');
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [beginPolling]);
+  }, [beginPolling, userNameForSync]);
 
   const chooseCluster = useCallback(
     async (clusterId: string) => {
@@ -649,11 +847,205 @@ export default function Index() {
     };
   }, [savedTab]);
 
+  const profileName = useMemo(() => {
+    return userNameForSync || DEFAULT_USER_NAME;
+  }, [userNameForSync]);
+
+  const profileInitials = useMemo(() => initialsForName(profileName), [profileName]);
+
+  const heroCards = useMemo(() => {
+    const topTrends = feedData?.top_trends ?? [];
+    const mapped = topTrends
+      .filter((item) => item && item.image_url && item.title)
+      .slice(0, 8)
+      .map((item) => ({
+        id: item.id,
+        title: item.title ?? 'Trending',
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+    return mapped.length > 0 ? mapped : FALLBACK_HERO_CARDS;
+  }, [feedData]);
+
+  const trendingProducts = useMemo(() => {
+    const items = feedData?.trending_products ?? [];
+    const mapped = items
+      .filter((item) => item && item.id)
+      .slice(0, 10)
+      .map((item) => ({
+        id: item.id,
+        brand: (item.brand ?? 'Trending').toUpperCase(),
+        name: item.name ?? `${item.brand ?? 'Trending'} pick`,
+        views: Math.max(0, Math.round(item.view_count ?? 0)),
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+    return mapped.length > 0 ? mapped : FALLBACK_TRENDING_PRODUCTS;
+  }, [feedData]);
+
+  const trendingBrands = useMemo(() => {
+    const brands = feedData?.trending_brands ?? [];
+    const mapped = brands
+      .filter((item) => item && item.id)
+      .slice(0, 10)
+      .map((item, index) => ({
+        id: item.id,
+        rank: `#${index + 1}`,
+        label: item.name ?? 'Brand',
+        visits: formatVisitCount(item.visit_count),
+      }));
+    return mapped.length > 0 ? mapped : FALLBACK_TRENDING_BRANDS;
+  }, [feedData]);
+
+  const popularSearches = useMemo(() => {
+    const searches = feedData?.popular_searches ?? [];
+    const mapped = searches
+      .filter((item) => item && item.label)
+      .slice(0, 20)
+      .map((item) => ({
+        id: item.id,
+        label: item.label ?? '',
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+    return mapped.length > 0 ? mapped : FALLBACK_POPULAR_SEARCHES;
+  }, [feedData]);
+
+  const searchBrandTiles = useMemo(() => {
+    const brands = feedData?.search_brands ?? [];
+    const mapped = brands
+      .filter((item) => item && item.id)
+      .slice(0, 12)
+      .map((item) => ({
+        id: item.id,
+        label: item.name ?? 'Brand',
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+    return mapped.length > 0 ? mapped : FALLBACK_SEARCH_BRAND_TILES;
+  }, [feedData]);
+
+  const brandSuggestions = useMemo(() => {
+    const brands = feedData?.search_brands ?? [];
+    const mapped = brands
+      .filter((item) => item && item.id)
+      .slice(0, 6)
+      .map((item) => ({
+        id: item.id,
+        label: item.name ?? 'Brand',
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+    return mapped.length > 0 ? mapped : FALLBACK_BRAND_SUGGESTIONS;
+  }, [feedData]);
+
+  const savedItems = useMemo(() => {
+    return (feedData?.saved_items ?? [])
+      .filter((item) => item && item.id)
+      .slice(0, 30)
+      .map((item) => ({
+        id: item.id,
+        name: item.name ?? 'Saved item',
+        brand: item.brand ?? 'Saved',
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+        price: item.price_usd ? `$${item.price_usd}` : null,
+      }));
+  }, [feedData]);
+
+  const forYouSeason = useMemo(() => {
+    const lead = heroCards[0];
+    if (lead) return lead;
+    return FALLBACK_HERO_CARDS[0];
+  }, [heroCards]);
+
+  const forYouProducts = useMemo(() => {
+    const fromTrending = (feedData?.trending_products ?? [])
+      .filter((item) => item && item.id)
+      .slice(0, 8)
+      .map((item) => ({
+        id: `trend-${item.id}`,
+        title: item.name ?? item.brand ?? 'Trending pick',
+        priceLabel: formatPriceLabel(item.price, item.brand ?? 'Trending'),
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+
+    const fromSaved = (feedData?.saved_items ?? [])
+      .filter((item) => item && item.id)
+      .slice(0, 8)
+      .map((item) => ({
+        id: `saved-${item.id}`,
+        title: item.name ?? item.brand ?? 'Saved item',
+        priceLabel: formatPriceLabel(item.price_usd, item.brand ?? 'Saved'),
+        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      }));
+
+    const merged = [...fromTrending, ...fromSaved];
+    return merged.length > 0 ? merged : FALLBACK_FOR_YOU_PRODUCTS;
+  }, [feedData]);
+
+  const exploreTiles = useMemo(() => {
+    const fromHero: ExploreTile[] = heroCards.map((card, index) => ({
+      id: `hero-${card.id}`,
+      title: card.title,
+      subtitle: `Top trend ${index + 1}`,
+      image: card.image,
+    }));
+    const fromSearch: ExploreTile[] = popularSearches.map((entry) => ({
+      id: `search-${entry.id}`,
+      title: entry.label,
+      subtitle: 'Popular search',
+      image: entry.image,
+    }));
+    const fromBrands: ExploreTile[] = searchBrandTiles.map((brand) => ({
+      id: `brand-${brand.id}`,
+      title: brand.label,
+      subtitle: 'Brand spotlight',
+      image: brand.image,
+    }));
+    const fromProducts: ExploreTile[] = trendingProducts.map((product) => ({
+      id: `product-${product.id}`,
+      title: product.name,
+      subtitle: product.brand,
+      image: product.image,
+    }));
+    const fromSaved: ExploreTile[] = savedItems.map((item) => ({
+      id: `saved-${item.id}`,
+      title: item.name,
+      subtitle: item.brand,
+      image: item.image,
+    }));
+
+    const merged = [...fromHero, ...fromSearch, ...fromBrands, ...fromProducts, ...fromSaved];
+    if (merged.length > 0) return merged;
+
+    return FALLBACK_HERO_CARDS.map((card, index) => ({
+      id: `fallback-${card.id}`,
+      title: card.title,
+      subtitle: `Explore pick ${index + 1}`,
+      image: card.image,
+    }));
+  }, [heroCards, popularSearches, searchBrandTiles, trendingProducts, savedItems]);
+
+  const pickExploreTile = useCallback(
+    (index: number): ExploreTile => exploreTiles[index % exploreTiles.length],
+    [exploreTiles],
+  );
+
+  const campaignText = useMemo(() => {
+    const name = (feedData?.active_campaign?.name ?? '').trim();
+    return name || 'Win a Birkin';
+  }, [feedData]);
+
+  const priceDropPill = useMemo(() => {
+    const count = feedData?.notifications?.price_drop_alert_count ?? 0;
+    return count > 0 ? `${count} alerts` : 'No updates';
+  }, [feedData]);
+
+  const inboxPill = useMemo(() => {
+    const count = feedData?.notifications?.notification_count ?? 0;
+    return count > 0 ? `• ${count} new` : '• 0 new';
+  }, [feedData]);
+
   const searchResults = useMemo(() => {
     const query = searchText.trim().toLowerCase();
-    if (!query) return POPULAR_SEARCHES;
-    return POPULAR_SEARCHES.filter((entry) => entry.label.toLowerCase().includes(query));
-  }, [searchText]);
+    if (!query) return popularSearches;
+    return popularSearches.filter((entry) => entry.label.toLowerCase().includes(query));
+  }, [popularSearches, searchText]);
 
   const renderSyncCard = (showItems: boolean) => (
     <View style={styles.syncCard}>
@@ -784,7 +1176,7 @@ export default function Index() {
         <Text style={[styles.sectionHeading, serifStyle()]}>Top trends</Text>
 
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.heroScroller}>
-          {HERO_CARDS.map((card) => (
+          {heroCards.map((card) => (
             <View key={card.id} style={styles.heroCard}>
               <Image source={{ uri: card.image }} style={styles.heroImage} />
               <View style={styles.heroOverlay}>
@@ -822,7 +1214,7 @@ export default function Index() {
       </View>
 
       <View style={styles.productGrid}>
-        {TRENDING_PRODUCTS.map((product) => (
+        {trendingProducts.map((product) => (
           <View key={product.id} style={styles.productCell}>
             <View style={styles.productImageWrap}>
               <Image source={{ uri: product.image }} style={styles.productImage} />
@@ -846,7 +1238,7 @@ export default function Index() {
       </View>
 
       <View>
-        {TRENDING_BRANDS.map((brand) => (
+        {trendingBrands.map((brand) => (
           <View key={brand.id} style={styles.brandRow}>
             <Text style={styles.brandRank}>{brand.rank}</Text>
             <View style={styles.brandInfo}>
@@ -869,11 +1261,13 @@ export default function Index() {
         <View style={styles.forYouSeasonCard}>
           <Image
             source={{
-              uri: 'https://images.unsplash.com/photo-1543076447-215ad9ba6923?auto=format&fit=crop&w=1000&q=80',
+              uri: forYouSeason.image,
             }}
             style={styles.forYouSeasonImage}
           />
-          <Text style={[styles.forYouSeasonLabel, serifStyle()]}>Winter</Text>
+          <Text style={[styles.forYouSeasonLabel, serifStyle()]} numberOfLines={2}>
+            {forYouSeason.title}
+          </Text>
         </View>
       </View>
 
@@ -889,116 +1283,89 @@ export default function Index() {
       </View>
 
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.forYouProductsScroller}>
-        {FOR_YOU_SPORT_PRODUCTS.map((item) => (
+        {forYouProducts.map((item) => (
           <View key={item.id} style={styles.forYouProductCard}>
             <Image source={{ uri: item.image }} style={styles.forYouProductImage} />
             <View style={styles.forYouBookmark}>
               <Feather name="bookmark" size={18} color="#9d9d9d" />
             </View>
-            <Text style={styles.forYouPrice}>{item.price}</Text>
+            <Text style={styles.forYouPrice}>{item.priceLabel}</Text>
           </View>
         ))}
       </ScrollView>
     </View>
   );
 
-  const renderHomeExploreFeed = () => (
-    <View style={styles.exploreFeedRoot}>
-      <View style={styles.exploreColumns}>
-        <View style={styles.exploreColumn}>
-          <View style={styles.exploreBootCard}>
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1516257984-b1b4d707412e?auto=format&fit=crop&w=900&q=80',
-              }}
-              style={styles.exploreBootImage}
-            />
-            <View style={styles.exploreBootOverlay}>
-              <Text style={styles.exploreBootTitle}>Boot Cut</Text>
-              <Text style={styles.exploreBootSubtitle}>20 items</Text>
+  const renderHomeExploreFeed = () => {
+    const boot = pickExploreTile(0);
+    const miniWide = pickExploreTile(1);
+    const miniNarrow = pickExploreTile(2);
+    const sharedMain = pickExploreTile(3);
+    const sharedSideOne = pickExploreTile(4);
+    const sharedSideTwo = pickExploreTile(5);
+    const sharedSideThree = pickExploreTile(6);
+    const look = pickExploreTile(7);
+    const right = pickExploreTile(8);
+
+    return (
+      <View style={styles.exploreFeedRoot}>
+        <View style={styles.exploreColumns}>
+          <View style={styles.exploreColumn}>
+            <View style={styles.exploreBootCard}>
+              <Image source={{ uri: boot.image }} style={styles.exploreBootImage} />
+              <View style={styles.exploreBootOverlay}>
+                <Text style={styles.exploreBootTitle} numberOfLines={1}>
+                  {boot.title}
+                </Text>
+                <Text style={styles.exploreBootSubtitle}>{boot.subtitle}</Text>
+              </View>
             </View>
-          </View>
 
-          <View style={styles.exploreMiniRow}>
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?auto=format&fit=crop&w=700&q=80',
-              }}
-              style={styles.exploreMiniWide}
-            />
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1604176424472-9d57a6f18e6c?auto=format&fit=crop&w=500&q=80',
-              }}
-              style={styles.exploreMiniNarrow}
-            />
-          </View>
-
-          <View style={styles.exploreCreatorRow}>
-            <View style={styles.exploreCreatorAvatar}>
-              <Text style={[styles.exploreCreatorAvatarText, serifStyle(true)]}>phia</Text>
+            <View style={styles.exploreMiniRow}>
+              <Image source={{ uri: miniWide.image }} style={styles.exploreMiniWide} />
+              <Image source={{ uri: miniNarrow.image }} style={styles.exploreMiniNarrow} />
             </View>
-            <Text style={styles.exploreCreatorLabel}>By @phiaco</Text>
-            <Ionicons name="checkmark-circle" size={17} color="#5d5d62" />
-          </View>
 
-          <View style={styles.exploreSharedCard}>
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1521572267360-ee0c2909d518?auto=format&fit=crop&w=900&q=80',
-              }}
-              style={styles.exploreSharedMain}
-            />
-            <View style={styles.exploreSharedSideColumn}>
-              <Image
-                source={{
-                  uri: 'https://images.unsplash.com/photo-1520975954732-35dd22cf7f8f?auto=format&fit=crop&w=400&q=80',
-                }}
-                style={styles.exploreSharedSideThumb}
-              />
-              <Image
-                source={{
-                  uri: 'https://images.unsplash.com/photo-1512436991641-6745cdb1723f?auto=format&fit=crop&w=400&q=80',
-                }}
-                style={styles.exploreSharedSideThumb}
-              />
-              <Image
-                source={{
-                  uri: 'https://images.unsplash.com/photo-1515843279827-4b82a9f5f44d?auto=format&fit=crop&w=400&q=80',
-                }}
-                style={styles.exploreSharedSideThumb}
-              />
+            <View style={styles.exploreCreatorRow}>
+              <View style={styles.exploreCreatorAvatar}>
+                <Text style={[styles.exploreCreatorAvatarText, serifStyle(true)]}>phia</Text>
+              </View>
+              <Text style={styles.exploreCreatorLabel}>Live from your feed</Text>
+              <Ionicons name="checkmark-circle" size={17} color="#5d5d62" />
             </View>
-          </View>
-          <Text style={styles.exploreSharedLabel}>The Shared Closet</Text>
-        </View>
 
-        <View style={styles.exploreColumn}>
-          <View style={styles.exploreLookCard}>
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1594938328870-9623159c8c99?auto=format&fit=crop&w=900&q=80',
-              }}
-              style={styles.exploreLookImage}
-            />
+            <View style={styles.exploreSharedCard}>
+              <Image source={{ uri: sharedMain.image }} style={styles.exploreSharedMain} />
+              <View style={styles.exploreSharedSideColumn}>
+                <Image source={{ uri: sharedSideOne.image }} style={styles.exploreSharedSideThumb} />
+                <Image source={{ uri: sharedSideTwo.image }} style={styles.exploreSharedSideThumb} />
+                <Image source={{ uri: sharedSideThree.image }} style={styles.exploreSharedSideThumb} />
+              </View>
+            </View>
+            <Text style={styles.exploreSharedLabel} numberOfLines={1}>
+              {sharedMain.title}
+            </Text>
           </View>
-          <Text style={styles.exploreLookTitle}>Refined Layering</Text>
 
-          <View style={styles.exploreRightCard}>
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1521572267360-ee0c2909d518?auto=format&fit=crop&w=900&q=80',
-              }}
-              style={styles.exploreRightCardImage}
-            />
-            <View style={styles.exploreBookmarkPill}>
-              <Feather name="bookmark" size={18} color="#9d9d9d" />
+          <View style={styles.exploreColumn}>
+            <View style={styles.exploreLookCard}>
+              <Image source={{ uri: look.image }} style={styles.exploreLookImage} />
+            </View>
+            <Text style={styles.exploreLookTitle} numberOfLines={1}>
+              {look.title}
+            </Text>
+
+            <View style={styles.exploreRightCard}>
+              <Image source={{ uri: right.image }} style={styles.exploreRightCardImage} />
+              <View style={styles.exploreBookmarkPill}>
+                <Feather name="bookmark" size={18} color="#9d9d9d" />
+              </View>
             </View>
           </View>
         </View>
       </View>
-    </View>
-  );
+    );
+  };
 
   const renderHome = () => (
     <View>
@@ -1007,7 +1374,9 @@ export default function Index() {
         <View style={styles.homeRightControls}>
           <Pressable style={styles.winPill}>
             <Feather name="gift" size={13} color="#fff" />
-            <Text style={styles.winPillText}>Win a Birkin</Text>
+            <Text style={styles.winPillText} numberOfLines={1}>
+              {campaignText}
+            </Text>
           </Pressable>
           <View style={styles.iconCluster}>
             <Pressable style={styles.iconButton}>
@@ -1039,6 +1408,8 @@ export default function Index() {
           </Pressable>
         ))}
       </View>
+
+      {feedError ? <Text style={styles.syncMetaText}>Live feed unavailable: {feedError}</Text> : null}
 
       {homeFeedTab === 'trending' ? renderHomeTrendingFeed() : null}
       {homeFeedTab === 'forYou' ? renderHomeForYouFeed() : null}
@@ -1130,7 +1501,7 @@ export default function Index() {
             showsHorizontalScrollIndicator={false}
             contentContainerStyle={styles.searchLookScroller}
           >
-            {HERO_CARDS.map((card) => (
+            {heroCards.map((card) => (
               <View key={card.id} style={styles.searchLookCard}>
                 <Image source={{ uri: card.image }} style={styles.searchLookImage} />
                 <View style={styles.heroOverlay}>
@@ -1152,7 +1523,7 @@ export default function Index() {
             </View>
           </View>
           <View style={styles.searchBrandGrid}>
-            {SEARCH_BRAND_TILES.map((brand) => (
+            {searchBrandTiles.map((brand) => (
               <View key={brand.id} style={styles.searchBrandTile}>
                 <Image source={{ uri: brand.image }} style={styles.searchBrandImage} />
                 <View style={styles.searchBrandOverlay} />
@@ -1225,14 +1596,27 @@ export default function Index() {
           </View>
 
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.placeholderCardRow}>
-            {[0, 1, 2].map((index) => (
-              <View key={index} style={styles.placeholderProduct}>
-                <View style={styles.placeholderBookmark}>
-                  <Feather name="bookmark" size={20} color="#95959a" />
-                </View>
-              </View>
-            ))}
+            {savedItems.length > 0
+              ? savedItems.slice(0, 10).map((item) => (
+                  <View key={item.id} style={styles.placeholderProduct}>
+                    <Image source={{ uri: item.image }} style={styles.productImage} />
+                    <View style={styles.placeholderBookmark}>
+                      <Feather name="bookmark" size={20} color="#95959a" />
+                    </View>
+                  </View>
+                ))
+              : [0, 1, 2].map((index) => (
+                  <View key={index} style={styles.placeholderProduct}>
+                    <View style={styles.placeholderBookmark}>
+                      <Feather name="bookmark" size={20} color="#95959a" />
+                    </View>
+                  </View>
+                ))}
           </ScrollView>
+
+          {savedItems.length === 0 ? (
+            <Text style={styles.syncMetaText}>No saved items returned yet for this session.</Text>
+          ) : null}
 
           {renderSyncCard(true)}
         </View>
@@ -1247,7 +1631,7 @@ export default function Index() {
             </View>
           </View>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.brandSuggestionRow}>
-            {BRAND_SUGGESTIONS.map((entry) => (
+            {brandSuggestions.map((entry) => (
               <View key={entry.id} style={styles.brandSuggestionCard}>
                 <Image source={{ uri: entry.image }} style={styles.brandSuggestionImage} />
                 <View style={styles.brandSuggestionOverlay} />
@@ -1296,17 +1680,17 @@ export default function Index() {
 
       <View style={styles.profileAvatarWrap}>
         <View style={styles.avatarPill}>
-          <Text style={[styles.avatarText, serifStyle()]}>AR</Text>
+          <Text style={[styles.avatarText, serifStyle()]}>{profileInitials}</Text>
         </View>
-        <Text style={[styles.profileName, serifStyle()]}>{CURRENT_USER_NAME}</Text>
+        <Text style={[styles.profileName, serifStyle()]}>{profileName}</Text>
         <Pressable style={styles.editProfileButton}>
           <Text style={styles.editProfileText}>Edit profile</Text>
         </Pressable>
       </View>
 
       <View style={styles.utilityGrid}>
-        {renderProfileCard('Price drop', 'alerts', 'notifications-outline', 'No updates')}
-        {renderProfileCard('Your link', 'history', 'attach-outline', '• 7 new')}
+        {renderProfileCard('Price drop', 'alerts', 'notifications-outline', priceDropPill)}
+        {renderProfileCard('Your link', 'history', 'attach-outline', inboxPill)}
       </View>
       <View style={styles.utilityGrid}>
         {renderProfileCard('Edit your', 'brands', 'albums-outline')}

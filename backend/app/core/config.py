@@ -36,6 +36,9 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_model: str = "gpt-5.4"
+    openai_image_tool_model: str = "gpt-5.4"
+    gemini_api_key: str = ""
+    gemini_image_model: str = "gemini-2.5-flash-image"
 
     aws_region: str = "us-east-1"
     aws_access_key_id: str = ""

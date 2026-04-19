@@ -53,6 +53,12 @@ def init_db(db_path: Path) -> None:
                 relative_path TEXT NOT NULL,
                 width INTEGER,
                 height INTEGER,
+                captured_at TEXT,
+                captured_at_epoch_ms INTEGER,
+                latitude REAL,
+                longitude REAL,
+                location_source TEXT,
+                metadata_json TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
@@ -125,8 +131,70 @@ def init_db(db_path: Path) -> None:
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS styling_auto_runs (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                photo_id TEXT NOT NULL UNIQUE,
+                trigger_item_id TEXT,
+                status TEXT NOT NULL,
+                source_photo_path TEXT NOT NULL,
+                face_crop_path TEXT,
+                selected_person_crop_path TEXT,
+                selected_person_bbox TEXT,
+                gpt_selected_index INTEGER,
+                gpt_selection_reason TEXT,
+                body_visible INTEGER,
+                prompt TEXT,
+                render_id TEXT,
+                best_variant_index INTEGER,
+                best_reason TEXT,
+                skip_reason TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(photo_id) REFERENCES photos(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_styling_auto_runs_job_id ON styling_auto_runs(job_id);
+            CREATE INDEX IF NOT EXISTS idx_styling_auto_runs_status ON styling_auto_runs(status);
+
+            CREATE TABLE IF NOT EXISTS styling_auto_variants (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                variant_index INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                output_path TEXT NOT NULL,
+                realism REAL,
+                aesthetic REAL,
+                overall REAL,
+                justification TEXT,
+                is_best INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES styling_auto_runs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_styling_auto_variants_run_id ON styling_auto_variants(run_id);
             """
         )
+
+        photo_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(photos)").fetchall()
+        }
+        if "captured_at" not in photo_columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN captured_at TEXT")
+        if "captured_at_epoch_ms" not in photo_columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN captured_at_epoch_ms INTEGER")
+        if "latitude" not in photo_columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN latitude REAL")
+        if "longitude" not in photo_columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN longitude REAL")
+        if "location_source" not in photo_columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN location_source TEXT")
+        if "metadata_json" not in photo_columns:
+            conn.execute("ALTER TABLE photos ADD COLUMN metadata_json TEXT")
 
         existing_columns = {
             row["name"]
@@ -210,13 +278,44 @@ def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
         return [_row_to_dict(r) for r in rows]
 
 
-def create_photo(job_id: str, relative_path: str, width: int | None, height: int | None) -> str:
+def create_photo(
+    job_id: str,
+    relative_path: str,
+    width: int | None,
+    height: int | None,
+    *,
+    captured_at: str | None = None,
+    captured_at_epoch_ms: int | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    location_source: str | None = None,
+    metadata_json: str | None = None,
+) -> str:
     photo_id = str(uuid.uuid4())
     now = utc_now_iso()
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO photos (id, job_id, relative_path, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (photo_id, job_id, relative_path, width, height, now),
+            """
+            INSERT INTO photos (
+                id, job_id, relative_path, width, height,
+                captured_at, captured_at_epoch_ms, latitude, longitude, location_source, metadata_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                photo_id,
+                job_id,
+                relative_path,
+                width,
+                height,
+                captured_at,
+                captured_at_epoch_ms,
+                latitude,
+                longitude,
+                location_source,
+                metadata_json,
+                now,
+            ),
         )
     return photo_id
 
@@ -558,3 +657,223 @@ def list_clothing_items(job_id: str) -> list[dict[str, Any]]:
         parsed["best_match"] = _json_or_default(parsed.get("best_match"), None)
         out.append(parsed)
     return out
+
+
+def list_clothing_items_for_photo(photo_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM clothing_items WHERE photo_id = ? ORDER BY created_at ASC",
+            (photo_id,),
+        ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        parsed = _row_to_dict(row)
+        parsed["colors"] = _json_or_default(parsed.get("colors"), [])
+        parsed["bounding_box"] = _json_or_default(parsed.get("bounding_box"), {})
+        parsed["exact_matches"] = _json_or_default(parsed.get("exact_matches"), [])
+        parsed["similar_products"] = _json_or_default(parsed.get("similar_products"), [])
+        parsed["phia_products"] = _json_or_default(parsed.get("phia_products"), [])
+        parsed["best_match"] = _json_or_default(parsed.get("best_match"), None)
+        out.append(parsed)
+    return out
+
+
+def claim_styling_auto_run(
+    *,
+    job_id: str,
+    photo_id: str,
+    source_photo_path: str,
+    face_crop_path: str | None,
+    trigger_item_id: str | None = None,
+) -> dict[str, Any]:
+    now = utc_now_iso()
+    run_id = str(uuid.uuid4())
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO styling_auto_runs (
+                id, job_id, photo_id, trigger_item_id, status, source_photo_path,
+                face_crop_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                job_id,
+                photo_id,
+                trigger_item_id,
+                "queued",
+                source_photo_path,
+                face_crop_path,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM styling_auto_runs WHERE photo_id = ?",
+            (photo_id,),
+        ).fetchone()
+    if not row:
+        raise RuntimeError("Failed to claim styling auto run")
+    parsed = _row_to_dict(row)
+    parsed["selected_person_bbox"] = _json_or_default(parsed.get("selected_person_bbox"), None)
+    parsed["is_new"] = parsed["id"] == run_id
+    return parsed
+
+
+def get_styling_auto_run(run_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM styling_auto_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+    if not row:
+        return None
+    parsed = _row_to_dict(row)
+    parsed["selected_person_bbox"] = _json_or_default(parsed.get("selected_person_bbox"), None)
+    return parsed
+
+
+def get_styling_auto_run_for_photo(photo_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM styling_auto_runs WHERE photo_id = ?",
+            (photo_id,),
+        ).fetchone()
+    if not row:
+        return None
+    parsed = _row_to_dict(row)
+    parsed["selected_person_bbox"] = _json_or_default(parsed.get("selected_person_bbox"), None)
+    return parsed
+
+
+def update_styling_auto_run(
+    run_id: str,
+    *,
+    status: str | None = None,
+    trigger_item_id: str | None | object = _UNSET,
+    selected_person_crop_path: str | None | object = _UNSET,
+    selected_person_bbox: dict[str, int] | None | object = _UNSET,
+    gpt_selected_index: int | None | object = _UNSET,
+    gpt_selection_reason: str | None | object = _UNSET,
+    body_visible: bool | None | object = _UNSET,
+    prompt: str | None | object = _UNSET,
+    render_id: str | None | object = _UNSET,
+    best_variant_index: int | None | object = _UNSET,
+    best_reason: str | None | object = _UNSET,
+    skip_reason: str | None | object = _UNSET,
+    error: str | None | object = _UNSET,
+    started_at: str | None | object = _UNSET,
+    finished_at: str | None | object = _UNSET,
+) -> None:
+    updates: list[str] = ["updated_at = ?"]
+    values: list[Any] = [utc_now_iso()]
+    if status is not None:
+        updates.append("status = ?")
+        values.append(status)
+    if trigger_item_id is not _UNSET:
+        updates.append("trigger_item_id = ?")
+        values.append(trigger_item_id)
+    if selected_person_crop_path is not _UNSET:
+        updates.append("selected_person_crop_path = ?")
+        values.append(selected_person_crop_path)
+    if selected_person_bbox is not _UNSET:
+        updates.append("selected_person_bbox = ?")
+        values.append(json.dumps(selected_person_bbox) if selected_person_bbox else None)
+    if gpt_selected_index is not _UNSET:
+        updates.append("gpt_selected_index = ?")
+        values.append(gpt_selected_index)
+    if gpt_selection_reason is not _UNSET:
+        updates.append("gpt_selection_reason = ?")
+        values.append(gpt_selection_reason)
+    if body_visible is not _UNSET:
+        updates.append("body_visible = ?")
+        values.append(None if body_visible is None else (1 if body_visible else 0))
+    if prompt is not _UNSET:
+        updates.append("prompt = ?")
+        values.append(prompt)
+    if render_id is not _UNSET:
+        updates.append("render_id = ?")
+        values.append(render_id)
+    if best_variant_index is not _UNSET:
+        updates.append("best_variant_index = ?")
+        values.append(best_variant_index)
+    if best_reason is not _UNSET:
+        updates.append("best_reason = ?")
+        values.append(best_reason)
+    if skip_reason is not _UNSET:
+        updates.append("skip_reason = ?")
+        values.append(skip_reason)
+    if error is not _UNSET:
+        updates.append("error = ?")
+        values.append(error)
+    if started_at is not _UNSET:
+        updates.append("started_at = ?")
+        values.append(started_at)
+    if finished_at is not _UNSET:
+        updates.append("finished_at = ?")
+        values.append(finished_at)
+
+    values.append(run_id)
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE styling_auto_runs SET {', '.join(updates)} WHERE id = ?",
+            values,
+        )
+
+
+def replace_styling_auto_variants(
+    run_id: str,
+    *,
+    variants: list[dict[str, Any]],
+    best_variant_index: int | None,
+) -> None:
+    now = utc_now_iso()
+    with _connect() as conn:
+        conn.execute("DELETE FROM styling_auto_variants WHERE run_id = ?", (run_id,))
+        for row in variants:
+            idx = int(row.get("variant_index") or 0)
+            conn.execute(
+                """
+                INSERT INTO styling_auto_variants (
+                    id, run_id, variant_index, prompt, output_path, realism, aesthetic,
+                    overall, justification, is_best, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    run_id,
+                    idx,
+                    str(row.get("prompt") or ""),
+                    str(row.get("output_path") or ""),
+                    row.get("realism"),
+                    row.get("aesthetic"),
+                    row.get("overall"),
+                    str(row.get("justification") or ""),
+                    1 if (best_variant_index is not None and idx == best_variant_index) else 0,
+                    now,
+                ),
+            )
+
+
+def list_styling_auto_runs(job_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM styling_auto_runs WHERE job_id = ? ORDER BY created_at ASC",
+            (job_id,),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        parsed = _row_to_dict(row)
+        parsed["selected_person_bbox"] = _json_or_default(parsed.get("selected_person_bbox"), None)
+        out.append(parsed)
+    return out
+
+
+def list_styling_auto_variants(run_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM styling_auto_variants WHERE run_id = ? ORDER BY variant_index ASC",
+            (run_id,),
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]

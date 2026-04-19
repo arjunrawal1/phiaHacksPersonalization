@@ -1,4 +1,6 @@
 import { PipelineDashboard } from "./components/pipeline-dashboard";
+import { PersonalizationPanel } from "./components/personalization-panel";
+import { StylingLab } from "./components/styling-lab";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -24,6 +26,9 @@ export default function Home() {
       </p>
 
       <PipelineDashboard backendUrl={BACKEND_URL} />
+      <PersonalizationPanel backendUrl={BACKEND_URL} />
+
+      <StylingLab backendUrl={BACKEND_URL} />
     </main>
   );
 }
