@@ -7,7 +7,11 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+)
 from pathlib import Path
 from typing import Any
 
@@ -1463,9 +1467,38 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
             if det["photo_id"] not in bbox_by_photo:
                 bbox_by_photo[det["photo_id"]] = det["bbox"]
 
-        item_ids: list[str] = []
-        per_photo_steps: list[dict[str, Any]] = []
         entries = list(bbox_by_photo.items())
+        item_ids: list[str] = []
+        per_photo_steps_by_photo: dict[str, dict[str, Any]] = {}
+
+        _debug_patch(
+            job_id,
+            patch={
+                "clothing_extraction": {
+                    "photo_count": len(entries),
+                    "completed_photo_count": 0,
+                    "per_photo_steps": [],
+                },
+            },
+        )
+
+        def publish_extraction_progress() -> None:
+            ordered_steps = [
+                per_photo_steps_by_photo[photo_id]
+                for photo_id, _ in entries
+                if photo_id in per_photo_steps_by_photo
+            ]
+            _debug_patch(
+                job_id,
+                patch={
+                    "clothing_extraction": {
+                        "item_count": len(item_ids),
+                        "photo_count": len(entries),
+                        "completed_photo_count": len(per_photo_steps_by_photo),
+                        "per_photo_steps": ordered_steps[:120],
+                    },
+                },
+            )
 
         def process_one(entry: tuple[str, dict[str, float]]) -> dict[str, Any]:
             photo_id, face_bbox = entry
@@ -1614,12 +1647,29 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
             for entry in entries:
                 result = process_one(entry)
                 item_ids.extend(result.get("item_ids", []))
-                per_photo_steps.append(result.get("step", {}))
+                step = result.get("step", {})
+                if isinstance(step, dict):
+                    step_photo_id = str(step.get("photo_id") or entry[0])
+                    per_photo_steps_by_photo[step_photo_id] = step
+                publish_extraction_progress()
         else:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                for result in pool.map(process_one, entries):
+                future_to_photo_id = {pool.submit(process_one, entry): entry[0] for entry in entries}
+                for future in as_completed(future_to_photo_id):
+                    result = future.result()
                     item_ids.extend(result.get("item_ids", []))
-                    per_photo_steps.append(result.get("step", {}))
+                    step = result.get("step", {})
+                    if isinstance(step, dict):
+                        fallback_photo_id = future_to_photo_id[future]
+                        step_photo_id = str(step.get("photo_id") or fallback_photo_id)
+                        per_photo_steps_by_photo[step_photo_id] = step
+                    publish_extraction_progress()
+
+        per_photo_steps = [
+            per_photo_steps_by_photo[photo_id]
+            for photo_id, _ in entries
+            if photo_id in per_photo_steps_by_photo
+        ]
 
         closet_key_by_item, dedupe_source = _assign_closet_item_keys(job_id, item_ids)
         unique_closet_item_count = (
@@ -1638,6 +1688,7 @@ def _extract_clothing_worker(job_id: str, cluster_id: str) -> None:
                     "closet_item_count": unique_closet_item_count,
                     "closet_dedupe_source": dedupe_source,
                     "photo_count": len(entries),
+                    "completed_photo_count": len(entries),
                     "finished_at": db.utc_now_iso(),
                     "per_photo_steps": per_photo_steps[:120],
                 },

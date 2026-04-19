@@ -87,6 +87,8 @@ Use `.env.example` as the source of truth.
 - `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` are required for Rekognition face clustering/alignment and auto-pick.
 - `AUTO_FACE_PICK_*` controls deterministic auto-pick thresholds.
 - `SERPAPI_KEY` enables exact/similar shopping candidates.
+- `GOOGLE_PLACES_API_KEY` enables Nearby Search enrichment for photo location labels (store/park/place names).
+- `GOOGLE_PLACES_NEARBY_RADIUS_M` controls nearby-place lookup radius in meters (default `75`).
 - `REPLICATE_API_TOKEN` enables optional bbox refinement.
 - Preferred: set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` to mirror `photoAlbumClosetApp` storage behavior. The backend uploads `photos/*`, `face_tiles/*`, and `clothing_crops/*` into public Supabase buckets and uses those public URLs for external model calls.
 - Fallback: `PUBLIC_MEDIA_BASE_URL` can be used as a publicly reachable backend URL when external services need to fetch `/media/*`.

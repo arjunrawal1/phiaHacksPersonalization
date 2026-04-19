@@ -18,6 +18,10 @@ type PhotoInsight = {
   captured_at?: string | null;
   latitude?: number | null;
   longitude?: number | null;
+  nearby_place_name?: string | null;
+  nearby_place_type?: string | null;
+  nearby_place_address?: string | null;
+  nearby_place_distance_m?: number | null;
 };
 
 type PersonalizationSummary = {
@@ -46,7 +50,15 @@ function formatWhen(raw: string | null | undefined): string {
   });
 }
 
-function formatLocation(lat?: number | null, lon?: number | null): string {
+function formatLocation(insight: PhotoInsight): string {
+  if (insight.nearby_place_name) {
+    if (insight.nearby_place_type) {
+      return `${insight.nearby_place_name} (${insight.nearby_place_type.replaceAll("_", " ")})`;
+    }
+    return insight.nearby_place_name;
+  }
+  const lat = insight.latitude;
+  const lon = insight.longitude;
   if (typeof lat !== "number" || typeof lon !== "number") return "location unavailable";
   return `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
 }
@@ -202,7 +214,7 @@ export function PersonalizationPanel({ backendUrl }: Props) {
                   className="w-72 shrink-0 rounded-xl border border-border bg-card p-2.5"
                 >
                   <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                    {formatWhen(insight.captured_at)} • {formatLocation(insight.latitude, insight.longitude)}
+                    {formatWhen(insight.captured_at)} • {formatLocation(insight)}
                   </div>
                   <div className="mt-1 text-xs font-semibold text-foreground">{insight.summary}</div>
                   <div className="mt-2 flex flex-wrap gap-1">

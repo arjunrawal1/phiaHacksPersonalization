@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type JobSummary = {
   id: string;
@@ -129,6 +129,7 @@ type JobDebug = {
     finished_at?: string;
     item_count?: number;
     photo_count?: number;
+    completed_photo_count?: number;
     per_photo_steps?: ClothingExtractionStep[];
   };
   events?: PipelineEvent[];
@@ -213,6 +214,19 @@ type BackfillFavoritesResponse = {
 
 const POLL_MS = 1200;
 type PhotoBreakdownViewMode = "original" | "vlm" | "final";
+const VLM_EMPTY_TERMINAL_REASONS = new Set([
+  "missing_photo_record",
+  "missing_external_photo_url",
+  "yolo_error",
+  "no_yolo_detections",
+]);
+const FINAL_EMPTY_TERMINAL_REASONS = new Set([
+  "missing_photo_record",
+  "missing_external_photo_url",
+  "yolo_error",
+  "no_yolo_detections",
+  "all_items_filtered",
+]);
 
 function isSerpProxyUrl(raw: string): boolean {
   try {
@@ -343,6 +357,8 @@ export function PipelineDashboard({ backendUrl }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busySelectClusterId, setBusySelectClusterId] = useState<string | null>(null);
   const [visibleSerpUrls, setVisibleSerpUrls] = useState<string[]>([]);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [isSerpChecking, setIsSerpChecking] = useState(false);
   const [carouselState, setCarouselState] = useState<{ key: string; index: number }>({
     key: "",
     index: 0,
@@ -354,8 +370,12 @@ export function PipelineDashboard({ backendUrl }: Props) {
   const [isBackfillBusy, setIsBackfillBusy] = useState(false);
   const [backfillNotice, setBackfillNotice] = useState<string | null>(null);
   const [backfillError, setBackfillError] = useState<string | null>(null);
+  const isLoadInFlightRef = useRef(false);
+  const lastSerpCandidateSignatureRef = useRef("");
 
   const load = useCallback(async () => {
+    if (isLoadInFlightRef.current) return;
+    isLoadInFlightRef.current = true;
     try {
       const jobsRes = await fetch(`${backendUrl}/api/jobs`, { cache: "no-store" });
       if (!jobsRes.ok) throw new Error(`Jobs HTTP ${jobsRes.status}`);
@@ -378,6 +398,9 @@ export function PipelineDashboard({ backendUrl }: Props) {
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsInitialLoading(false);
+      isLoadInFlightRef.current = false;
     }
   }, [backendUrl, selectedJobId]);
 
@@ -511,18 +534,27 @@ export function PipelineDashboard({ backendUrl }: Props) {
   const chosenFacePhotoIndex =
     carouselState.key === carouselKey ? Math.min(carouselState.index, carouselMaxIndex) : 0;
   const activeChosenFaceRow = chosenFacePhotoRows[chosenFacePhotoIndex] ?? null;
-  const activePhotoViewMode: PhotoBreakdownViewMode = photoViewState.key === carouselKey ? photoViewState.mode : "final";
+  const preferredPhotoViewMode: PhotoBreakdownViewMode =
+    photoViewState.key === carouselKey ? photoViewState.mode : "final";
 
   const setChosenFacePhotoIndex = (nextIndex: number) => {
     const clamped = Math.max(0, Math.min(carouselMaxIndex, nextIndex));
     setCarouselState({ key: carouselKey, index: clamped });
   };
-  const setActivePhotoViewMode = (mode: PhotoBreakdownViewMode) => {
-    setPhotoViewState({ key: carouselKey, mode });
-  };
+  const setActivePhotoViewMode = useCallback(
+    (mode: PhotoBreakdownViewMode) => {
+      setPhotoViewState({ key: carouselKey, mode });
+    },
+    [carouselKey]
+  );
 
   useEffect(() => {
     let cancelled = false;
+    const candidateSignature = serpCandidates.join("||");
+    if (candidateSignature === lastSerpCandidateSignatureRef.current) {
+      return;
+    }
+    lastSerpCandidateSignatureRef.current = candidateSignature;
 
     const checkUrl = (url: string): Promise<{ url: string; ok: boolean }> =>
       new Promise((resolve) => {
@@ -549,12 +581,17 @@ export function PipelineDashboard({ backendUrl }: Props) {
 
     const run = async () => {
       if (serpCandidates.length === 0) {
-        if (!cancelled) setVisibleSerpUrls([]);
+        if (!cancelled) {
+          setVisibleSerpUrls([]);
+          setIsSerpChecking(false);
+        }
         return;
       }
+      setIsSerpChecking(true);
       const checks = await Promise.all(serpCandidates.map((url) => checkUrl(url)));
       if (cancelled) return;
       setVisibleSerpUrls(checks.filter((c) => c.ok).map((c) => c.url));
+      setIsSerpChecking(false);
     };
 
     void run();
@@ -562,6 +599,23 @@ export function PipelineDashboard({ backendUrl }: Props) {
       cancelled = true;
     };
   }, [serpCandidates]);
+
+  const activePhotoStep = activeChosenFaceRow ? clothingStepByPhoto.get(activeChosenFaceRow.photo.id) : null;
+  const activePhotoYoloCount = activePhotoStep?.yolo_world_detections?.length ?? 0;
+  const activePhotoGptCount = activePhotoStep?.gpt_cleaned_items?.length ?? 0;
+  const activePhotoFinalCount = activePhotoGptCount > 0 ? activePhotoGptCount : activeChosenFaceRow?.items.length ?? 0;
+  const activePhotoViewMode: PhotoBreakdownViewMode =
+    !activeChosenFaceRow
+      ? preferredPhotoViewMode
+      : preferredPhotoViewMode === "original"
+        ? activePhotoFinalCount > 0
+          ? "final"
+          : activePhotoYoloCount > 0
+            ? "vlm"
+            : "original"
+        : preferredPhotoViewMode === "final" && activePhotoFinalCount === 0 && activePhotoYoloCount > 0
+          ? "vlm"
+          : preferredPhotoViewMode;
 
   const chooseCluster = useCallback(
     async (clusterId: string) => {
@@ -650,11 +704,14 @@ export function PipelineDashboard({ backendUrl }: Props) {
             </button>
           ))}
         </div>
+        {jobs.length === 0 && isInitialLoading ? (
+          <div className="mt-3 text-sm text-muted-foreground">Loading jobs...</div>
+        ) : null}
       </section>
 
       {!detail ? (
         <section className="phia-panel p-5 text-sm text-muted-foreground">
-          Waiting for selected job...
+          {isInitialLoading ? "Loading selected job..." : "Waiting for selected job..."}
         </section>
       ) : (
         <section className="phia-panel space-y-6 p-5">
@@ -737,6 +794,12 @@ export function PipelineDashboard({ backendUrl }: Props) {
               <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 {`Google Image Response For "${personName}"`}
               </h3>
+              {isSerpChecking && visibleSerpUrls.length === 0 ? (
+                <div className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-accent" />
+                  Checking image URLs...
+                </div>
+              ) : null}
               <div className="phia-scroll h-[520px] overflow-y-auto pr-1">
                 <div className="grid grid-cols-3 gap-2 lg:grid-cols-4">
                   {visibleSerpUrls.slice(0, 24).map((url, idx) => (
@@ -760,6 +823,11 @@ export function PipelineDashboard({ backendUrl }: Props) {
                     </a>
                   ))}
                 </div>
+                {!isSerpChecking && visibleSerpUrls.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                    No image matches loaded yet.
+                  </div>
+                ) : null}
               </div>
             </section>
           </div>
@@ -873,10 +941,43 @@ export function PipelineDashboard({ backendUrl }: Props) {
                     const step = clothingStepByPhoto.get(photo.id);
                     const yoloOutput = step?.yolo_world_detections ?? [];
                     const gptCleaned = step?.gpt_cleaned_items ?? [];
-                    const finalBoxes: Array<{ description?: string; bounding_box?: StepBox }> = gptCleaned.map((item) => ({
+                    const finalBoxesFromStep: Array<{ description?: string; bounding_box?: StepBox }> = gptCleaned.map((item) => ({
                       description: item.description,
                       bounding_box: item.bounding_box,
                     }));
+                    const finalBoxesFromItems: Array<{ description?: string; bounding_box?: StepBox }> = items
+                      .filter((item) => !!item.bounding_box)
+                      .map((item) => ({
+                        description: item.description,
+                        bounding_box: item.bounding_box,
+                      }));
+                    const finalBoxes = finalBoxesFromStep.length > 0 ? finalBoxesFromStep : finalBoxesFromItems;
+                    const hasVlmBoxes = yoloOutput.length > 0;
+                    const hasFinalBoxes = finalBoxes.length > 0;
+                    const extractionState = detail?.debug?.stages?.clothing_extraction;
+                    const extractionDebug = detail?.debug?.clothing_extraction;
+                    const extractionPhotoCount = Number(extractionDebug?.photo_count ?? chosenFacePhotoRows.length);
+                    const extractionCompletedPhotoCount = Number(extractionDebug?.completed_photo_count ?? 0);
+                    const isExtractionRunning = detail?.status === "extracting_clothing" || extractionState === "running";
+                    const stepReason = String(step?.reason ?? "");
+                    const yoloStatus = String(step?.yolo_debug?.status ?? "");
+                    const yoloPredictionStatus = String(step?.yolo_debug?.prediction_status ?? "");
+                    const vlmTerminal =
+                      VLM_EMPTY_TERMINAL_REASONS.has(stepReason) ||
+                      yoloStatus === "failed" ||
+                      yoloStatus === "exception" ||
+                      yoloStatus === "skipped" ||
+                      yoloPredictionStatus === "failed" ||
+                      yoloPredictionStatus === "canceled";
+                    const finalTerminal =
+                      FINAL_EMPTY_TERMINAL_REASONS.has(stepReason) ||
+                      yoloStatus === "failed" ||
+                      yoloStatus === "exception" ||
+                      yoloStatus === "skipped";
+                    const isPhotoQueued = isExtractionRunning && !step;
+                    const isVlmLoading = isExtractionRunning && !hasVlmBoxes && !vlmTerminal;
+                    const isFinalLoading = isExtractionRunning && !hasFinalBoxes && !finalTerminal;
+                    const isItemLoading = isExtractionRunning && items.length === 0 && !finalTerminal;
 
                     const modeLabel =
                       activePhotoViewMode === "original"
@@ -942,6 +1043,30 @@ export function PipelineDashboard({ backendUrl }: Props) {
                             <div className="mt-1">{modeLabel}</div>
                             <div>{modeCount} boxes</div>
                             <div className="mt-1">YOLO: {yoloOutput.length}</div>
+                            {isExtractionRunning ? (
+                              <div className="mt-1">
+                                Extraction progress: {Math.min(extractionCompletedPhotoCount, extractionPhotoCount)}/
+                                {extractionPhotoCount}
+                              </div>
+                            ) : null}
+                            {isPhotoQueued ? (
+                              <div className="mt-1 inline-flex items-center gap-1.5 text-amber-700">
+                                <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                                Photo queued
+                              </div>
+                            ) : null}
+                            {isVlmLoading ? (
+                              <div className="mt-1 inline-flex items-center gap-1.5 text-orange-700">
+                                <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                                VLM loading
+                              </div>
+                            ) : null}
+                            {isFinalLoading ? (
+                              <div className="mt-1 inline-flex items-center gap-1.5 text-red-700">
+                                <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                                Finalizing
+                              </div>
+                            ) : null}
                           </div>
                         </aside>
 
@@ -980,6 +1105,22 @@ export function PipelineDashboard({ backendUrl }: Props) {
                                     </div>
                                   ))
                                 : null}
+                              {activePhotoViewMode === "vlm" && isVlmLoading ? (
+                                <div className="pointer-events-none absolute inset-x-3 bottom-3 rounded-xl border border-orange-300 bg-orange-50/95 px-2 py-1.5 text-[11px] text-orange-900">
+                                  <span className="inline-flex items-center gap-1.5">
+                                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-orange-500 border-t-transparent" />
+                                    Detecting clothing regions...
+                                  </span>
+                                </div>
+                              ) : null}
+                              {activePhotoViewMode === "final" && isFinalLoading ? (
+                                <div className="pointer-events-none absolute inset-x-3 bottom-3 rounded-xl border border-red-300 bg-red-50/95 px-2 py-1.5 text-[11px] text-red-900">
+                                  <span className="inline-flex items-center gap-1.5">
+                                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-red-500 border-t-transparent" />
+                                    Building final item boxes...
+                                  </span>
+                                </div>
+                              ) : null}
                             </div>
 
                             {activePhotoViewMode !== "original" ? (
@@ -989,7 +1130,19 @@ export function PipelineDashboard({ backendUrl }: Props) {
                                 </div>
                                 <div className="phia-scroll mt-2 max-h-[360px] space-y-1 overflow-y-auto pr-1">
                                   {legendEntries.length === 0 ? (
-                                    <div className="text-xs text-muted-foreground">No detections yet.</div>
+                                    activePhotoViewMode === "vlm" && isVlmLoading ? (
+                                      <div className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                                        <span className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-orange-500" />
+                                        VLM detections loading...
+                                      </div>
+                                    ) : activePhotoViewMode === "final" && isFinalLoading ? (
+                                      <div className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                                        <span className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-red-500" />
+                                        Final labels loading...
+                                      </div>
+                                    ) : (
+                                      <div className="text-xs text-muted-foreground">No detections yet.</div>
+                                    )
                                   ) : (
                                     legendEntries.map((entry) => (
                                       <div key={`${photo.id}-legend-${entry.index}`} className="flex items-start gap-2 rounded-xl border border-border bg-card px-2 py-1">
@@ -1018,7 +1171,14 @@ export function PipelineDashboard({ backendUrl }: Props) {
                             <div className="phia-scroll h-64 overflow-y-auto pr-1">
                               {items.length === 0 ? (
                                 <div className="rounded-xl border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
-                                  No extracted items yet.
+                                  {isItemLoading ? (
+                                    <span className="inline-flex items-center gap-1.5">
+                                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-accent" />
+                                      Extracting items for this photo...
+                                    </span>
+                                  ) : (
+                                    "No extracted items yet."
+                                  )}
                                 </div>
                               ) : (
                                 (() => {

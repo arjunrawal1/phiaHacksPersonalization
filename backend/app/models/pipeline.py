@@ -154,6 +154,10 @@ class PersonalizationPhotoInsight(BaseModel):
     captured_at: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    nearby_place_name: str | None = None
+    nearby_place_type: str | None = None
+    nearby_place_address: str | None = None
+    nearby_place_distance_m: float | None = None
 
 
 class PersonalizationSummaryResponse(BaseModel):

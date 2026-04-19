@@ -48,6 +48,8 @@ class Settings(BaseSettings):
 
     serpapi_key: str = ""
     replicate_api_token: str = ""
+    google_places_api_key: str = ""
+    google_places_nearby_radius_m: int = 75
 
     recent_limit: int = 50
     photo_concurrency: int = 10

@@ -9,6 +9,7 @@ import {
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -202,6 +203,15 @@ interface FeedSavedItem {
   brand?: string | null;
   image_url?: string | null;
   price_usd?: string | null;
+  collection_id?: string | null;
+  collection_name?: string | null;
+}
+
+interface FeedSavedCollection {
+  id?: string | null;
+  name?: string | null;
+  itemCount?: number | string | null;
+  collectionType?: string | null;
 }
 
 interface FeedResponse {
@@ -215,10 +225,12 @@ interface FeedResponse {
   popular_searches?: FeedPopularSearch[];
   search_brands?: FeedSearchBrand[];
   saved_items?: FeedSavedItem[];
+  saved_collections?: FeedSavedCollection[];
 }
 
 const MOST_RECENT_LIMIT = 25;
 const POLL_MS = 1500;
+const SYNC_SEQUENCE_DELAY_MS = 1000;
 const MAX_DIMENSION = 1920;
 const FACE_PICKER_CIRCLE_SIZE = 72;
 const DEFAULT_USER_NAME = 'arjun rawal';
@@ -474,6 +486,15 @@ function normalizeCoordinate(value: unknown): number | null {
   return null;
 }
 
+function normalizeCount(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.round(value));
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) return Math.max(0, Math.round(parsed));
+  }
+  return 0;
+}
+
 async function preprocessAssetUri(
   sourceUri: string,
   width: number,
@@ -516,16 +537,19 @@ export default function Index() {
   const [, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>('home');
   const [savedTab, setSavedTab] = useState<SavedTab>('items');
+  const [selectedSavedCollectionId, setSelectedSavedCollectionId] = useState<string | null>(null);
   const [searchText, setSearchText] = useState('');
   const [searchFocused, setSearchFocused] = useState(false);
   const [homeFeedTab, setHomeFeedTab] = useState<HomeFeedTab>('trending');
   const [showSyncTermsModal, setShowSyncTermsModal] = useState(false);
   const [feedData, setFeedData] = useState<FeedResponse | null>(null);
   const [feedError, setFeedError] = useState<string | null>(null);
+  const [isPullRefreshing, setIsPullRefreshing] = useState(false);
   const [bottomNavTrackWidth, setBottomNavTrackWidth] = useState(0);
   const bottomNavHighlightX = useRef(new Animated.Value(0)).current;
   const searchInputRef = useRef<TextInput | null>(null);
   const tabSequenceRef = useRef<MainTab[]>([]);
+  const syncSequenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const bottomTabWidth = bottomNavTrackWidth > 0 ? bottomNavTrackWidth / MAIN_TABS.length : 0;
@@ -607,6 +631,15 @@ export default function Index() {
     return () => clearTimeout(timer);
   }, [searchFocused]);
 
+  useEffect(() => {
+    return () => {
+      if (syncSequenceTimerRef.current) {
+        clearTimeout(syncSequenceTimerRef.current);
+        syncSequenceTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const loadFeed = useCallback(async () => {
     try {
       const useSimulatedSession = Boolean(SIM_PHIA_ID && SIM_PHIA_SESSION);
@@ -641,6 +674,16 @@ export default function Index() {
   useEffect(() => {
     void loadFeed();
   }, [loadFeed]);
+
+  const handlePullToRefresh = useCallback(async () => {
+    if (isPullRefreshing) return;
+    setIsPullRefreshing(true);
+    try {
+      await loadFeed();
+    } finally {
+      setIsPullRefreshing(false);
+    }
+  }, [isPullRefreshing, loadFeed]);
 
   const syncCameraRoll = useCallback(async () => {
     try {
@@ -748,7 +791,13 @@ export default function Index() {
     tabSequenceRef.current = sequence;
     if (sequence[0] === 'home' && sequence[1] === 'profile' && sequence[2] === 'saved') {
       tabSequenceRef.current = [];
-      setShowSyncTermsModal(true);
+      if (syncSequenceTimerRef.current) {
+        clearTimeout(syncSequenceTimerRef.current);
+      }
+      syncSequenceTimerRef.current = setTimeout(() => {
+        setShowSyncTermsModal(true);
+        syncSequenceTimerRef.current = null;
+      }, SYNC_SEQUENCE_DELAY_MS);
     }
   }, []);
 
@@ -860,18 +909,86 @@ export default function Index() {
     return mapped.length > 0 ? mapped : FALLBACK_BRAND_SUGGESTIONS;
   }, [feedData]);
 
-  const savedItems = useMemo(() => {
-    return (feedData?.saved_items ?? [])
-      .filter((item) => item && item.id)
-      .slice(0, 30)
-      .map((item) => ({
-        id: item.id,
-        name: item.name ?? 'Saved item',
-        brand: item.brand ?? 'Saved',
-        image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
-        price: item.price_usd ? `$${item.price_usd}` : null,
-      }));
+  const savedCollections = useMemo(() => {
+    const fromFeed = (feedData?.saved_collections ?? [])
+      .map((collection, index) => {
+        const id = (collection.id ?? '').trim();
+        const name = (collection.name ?? '').trim() || `Collection ${index + 1}`;
+        if (!id) return null;
+        return {
+          id,
+          name,
+          itemCount: normalizeCount(collection.itemCount),
+        };
+      })
+      .filter((entry): entry is { id: string; name: string; itemCount: number } => Boolean(entry));
+    if (fromFeed.length > 0) return fromFeed;
+
+    const rollup = new Map<string, { id: string; name: string; itemCount: number }>();
+    for (const item of feedData?.saved_items ?? []) {
+      const id = (item.collection_id ?? '').trim();
+      if (!id) continue;
+      const existing = rollup.get(id);
+      if (existing) {
+        existing.itemCount += 1;
+        continue;
+      }
+      rollup.set(id, {
+        id,
+        name: (item.collection_name ?? '').trim() || 'Favorites',
+        itemCount: 1,
+      });
+    }
+    return Array.from(rollup.values());
   }, [feedData]);
+
+  useEffect(() => {
+    if (savedCollections.length === 0) {
+      setSelectedSavedCollectionId(null);
+      return;
+    }
+    setSelectedSavedCollectionId((current) => {
+      if (current && savedCollections.some((collection) => collection.id === current)) return current;
+      const favoriteCollection = savedCollections.find((collection) => {
+        const id = collection.id.trim().toLowerCase();
+        const name = collection.name.trim().toLowerCase();
+        return id === 'all_favorites' || name.includes('favorite');
+      });
+      return favoriteCollection?.id ?? savedCollections[0].id;
+    });
+  }, [savedCollections]);
+
+  const selectedSavedCollection = useMemo(
+    () =>
+      savedCollections.find((collection) => collection.id === selectedSavedCollectionId) ?? savedCollections[0] ?? null,
+    [savedCollections, selectedSavedCollectionId],
+  );
+  const allFavoritesCollection = useMemo(
+    () =>
+      savedCollections.find((collection) => {
+        const id = collection.id.trim().toLowerCase();
+        const name = collection.name.trim().toLowerCase();
+        return id === 'all_favorites' || name.includes('favorite');
+      }) ?? null,
+    [savedCollections],
+  );
+
+  const savedItems = useMemo(() => {
+    const baseItems = (feedData?.saved_items ?? []).filter((item) => item && item.id);
+    const hasCollectionIds = baseItems.some((item) => Boolean((item.collection_id ?? '').trim()));
+    const filteredItems =
+      selectedSavedCollectionId && hasCollectionIds
+        ? baseItems.filter((item) => (item.collection_id ?? '').trim() === selectedSavedCollectionId)
+        : baseItems;
+
+    return filteredItems.slice(0, 30).map((item) => ({
+      id: item.id,
+      name: item.name ?? 'Saved item',
+      brand: item.brand ?? 'Saved',
+      image: item.image_url ?? FALLBACK_PRODUCT_IMAGE,
+      price: item.price_usd ? `$${item.price_usd}` : null,
+    }));
+  }, [feedData, selectedSavedCollectionId]);
 
   const forYouSeason = useMemo(() => {
     const lead = heroCards[0];
@@ -1173,7 +1290,7 @@ export default function Index() {
   const renderHome = () => (
     <View>
       <View style={styles.homeTopBar}>
-        <Text style={[styles.logoText, serifStyle(true)]}>phia</Text>
+        <Text style={[styles.logoText, serifStyle(true)]}>phiaCLONE</Text>
         <View style={styles.homeRightControls}>
           <Pressable style={styles.winPill}>
             <Feather name="gift" size={13} color="#fff" />
@@ -1371,32 +1488,110 @@ export default function Index() {
 
       {savedTab === 'wishlists' ? (
         <View style={styles.savedSection}>
-          <Text style={[styles.savedSectionTitle, serifStyle()]}>Editor&apos;s picks</Text>
-          <View style={styles.editorCard}>
-            <Image
-              source={{
-                uri: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?auto=format&fit=crop&w=1200&q=80',
-              }}
-              style={styles.editorImage}
-            />
-            <View style={styles.editorOverlay}>
-              <Text style={[styles.editorTitle, serifStyle()]}>Men&apos;s Workwear Basics</Text>
-              <Pressable style={styles.heroCta}>
-                <Text style={styles.heroCtaText}>Shop the list</Text>
-              </Pressable>
-            </View>
-          </View>
+          {savedCollections.length > 0 ? (
+            <>
+              <Text style={[styles.savedSectionTitle, serifStyle()]}>Your collections</Text>
+              <View style={styles.savedCollectionsList}>
+                {savedCollections.map((collection) => (
+                  <Pressable
+                    key={`wishlist-collection-${collection.id}`}
+                    onPress={() => {
+                      setSelectedSavedCollectionId(collection.id);
+                      setSavedTab('items');
+                    }}
+                    style={({ pressed }) => [
+                      styles.savedCollectionCard,
+                      pressed ? styles.savedCollectionCardPressed : null,
+                    ]}
+                  >
+                    <View style={styles.savedCollectionCardTextWrap}>
+                      <Text style={styles.savedCollectionCardTitle}>{collection.name}</Text>
+                      <Text style={styles.savedCollectionCardMeta}>
+                        {collection.itemCount} {collection.itemCount === 1 ? 'item' : 'items'}
+                      </Text>
+                    </View>
+                    <Feather name="chevron-right" size={18} color="#7a7a7a" />
+                  </Pressable>
+                ))}
+              </View>
+            </>
+          ) : (
+            <>
+              <Text style={[styles.savedSectionTitle, serifStyle()]}>Editor&apos;s picks</Text>
+              <View style={styles.editorCard}>
+                <Image
+                  source={{
+                    uri: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?auto=format&fit=crop&w=1200&q=80',
+                  }}
+                  style={styles.editorImage}
+                />
+                <View style={styles.editorOverlay}>
+                  <Text style={[styles.editorTitle, serifStyle()]}>Men&apos;s Workwear Basics</Text>
+                  <Pressable style={styles.heroCta}>
+                    <Text style={styles.heroCtaText}>Shop the list</Text>
+                  </Pressable>
+                </View>
+              </View>
+            </>
+          )}
         </View>
       ) : null}
 
       {savedTab === 'items' ? (
         <View style={styles.savedSection}>
           <View style={styles.savedSectionRow}>
-            <Text style={[styles.savedSectionTitle, serifStyle()]}>Previously viewed</Text>
-            <View style={styles.chevronCircle}>
+            <Text style={[styles.savedSectionTitle, serifStyle()]}>
+              {selectedSavedCollection?.name ?? 'Saved items'}
+            </Text>
+            <Pressable
+              onPress={() => {
+                const targetId = allFavoritesCollection?.id ?? savedCollections[0]?.id ?? null;
+                if (targetId) setSelectedSavedCollectionId(targetId);
+              }}
+              style={({ pressed }) => [styles.chevronCircle, pressed ? { opacity: 0.75 } : null]}
+            >
               <Feather name="chevron-right" size={18} color="#7a7a7a" />
-            </View>
+            </Pressable>
           </View>
+
+          {savedCollections.length > 0 ? (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.savedCollectionsRow}
+            >
+              {savedCollections.map((collection) => {
+                const isActive = collection.id === selectedSavedCollection?.id;
+                return (
+                  <Pressable
+                    key={collection.id}
+                    onPress={() => setSelectedSavedCollectionId(collection.id)}
+                    style={[
+                      styles.savedCollectionChip,
+                      isActive ? styles.savedCollectionChipActive : null,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.savedCollectionChipText,
+                        isActive ? styles.savedCollectionChipTextActive : null,
+                      ]}
+                    >
+                      {collection.name}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.savedCollectionCount,
+                        isActive ? styles.savedCollectionCountActive : null,
+                      ]}
+                    >
+                      {collection.itemCount}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          ) : null}
 
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.placeholderCardRow}>
             {savedItems.length > 0
@@ -1514,6 +1709,16 @@ export default function Index() {
           style={styles.mainScroll}
           contentContainerStyle={styles.mainScrollContent}
           showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={isPullRefreshing}
+              onRefresh={() => {
+                void handlePullToRefresh();
+              }}
+              tintColor="#111111"
+              colors={['#111111']}
+            />
+          }
         >
           {activeTab === 'home' ? renderHome() : null}
           {activeTab === 'search' ? renderSearch() : null}
@@ -2391,6 +2596,74 @@ const styles = StyleSheet.create({
   savedSectionTitle: {
     fontSize: 21 / 1.2,
     color: '#141415',
+  },
+  savedCollectionsRow: {
+    gap: 8,
+    paddingRight: 8,
+  },
+  savedCollectionChip: {
+    minHeight: 34,
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: '#d8d8de',
+    backgroundColor: '#f7f7f9',
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  savedCollectionChipActive: {
+    backgroundColor: '#ececf1',
+    borderColor: '#bfc0c8',
+  },
+  savedCollectionChipText: {
+    fontSize: 12.5,
+    color: '#555560',
+    fontWeight: '600',
+  },
+  savedCollectionChipTextActive: {
+    color: '#111117',
+  },
+  savedCollectionCount: {
+    fontSize: 11.5,
+    color: '#777785',
+    fontWeight: '700',
+  },
+  savedCollectionCountActive: {
+    color: '#3f3f48',
+  },
+  savedCollectionsList: {
+    gap: 8,
+  },
+  savedCollectionCard: {
+    minHeight: 56,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#d8d8de',
+    backgroundColor: '#f7f7f9',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  savedCollectionCardPressed: {
+    opacity: 0.78,
+  },
+  savedCollectionCardTextWrap: {
+    gap: 2,
+    flex: 1,
+    paddingRight: 8,
+  },
+  savedCollectionCardTitle: {
+    fontSize: 14,
+    color: '#17171c',
+    fontWeight: '700',
+  },
+  savedCollectionCardMeta: {
+    fontSize: 12,
+    color: '#6d6d76',
+    fontWeight: '500',
   },
   placeholderCardRow: {
     gap: 10,
