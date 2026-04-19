@@ -54,6 +54,16 @@ class Settings(BaseSettings):
     auto_face_pick_margin: float = 0.12
     auto_face_pick_alignment_floor: float = 0.5
 
+    phia_graphql_url: str = "https://api.phia.com/v2/graphql"
+    phia_collection_id: str = "all_favorites"
+    phia_id: str = ""
+    phia_session_cookie: str = ""
+    phia_bearer_token: str = ""
+    phia_platform: str = "IOS_APP"
+    phia_platform_version: str = "2.3.11.362"
+    phia_capture_dirs: list[str] = []
+    phia_allow_insecure_tls: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

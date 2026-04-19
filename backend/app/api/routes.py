@@ -7,13 +7,15 @@ from PIL import Image
 
 from app.core.config import get_settings
 from app.models.pipeline import (
+    BackfillFavoritesRequest,
+    BackfillFavoritesResponse,
     CreateJobResponse,
     JobDetail,
     JobSummary,
     SelectClusterRequest,
     SelectClusterResponse,
 )
-from app.services import db, pipeline
+from app.services import db, phia, pipeline
 
 router = APIRouter()
 
@@ -171,6 +173,30 @@ def refresh_item(item_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="Item not found")
     pipeline.refresh_item_lookup(item_id)
     return {"ok": True, "item_id": item_id}
+
+
+@router.post(
+    "/api/phia/backfill-favorites",
+    response_model=BackfillFavoritesResponse,
+    tags=["phia"],
+)
+def backfill_favorites(
+    body: BackfillFavoritesRequest,
+) -> dict[str, object]:
+    product_urls = [u.strip() for u in body.product_urls if u and u.strip()]
+    if not product_urls:
+        raise HTTPException(status_code=400, detail="No product URLs provided")
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    try:
+        return phia.backfill_favorites(
+            product_urls=product_urls,
+            settings=settings,
+            collection_id=body.collection_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _media_base_url(request: Request) -> str:

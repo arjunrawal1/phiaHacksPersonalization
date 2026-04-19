@@ -195,6 +195,21 @@ type Props = {
   backendUrl: string;
 };
 
+type BackfillFavoritesResponse = {
+  phia_id: string;
+  collection_id: string;
+  source: string;
+  requested_count: number;
+  attempted_count: number;
+  added_count: number;
+  failed_count: number;
+  results: Array<{
+    product_url: string;
+    ok: boolean;
+    message: string;
+  }>;
+};
+
 const POLL_MS = 1200;
 type PhotoBreakdownViewMode = "original" | "vlm" | "final";
 
@@ -335,6 +350,9 @@ export function PipelineDashboard({ backendUrl }: Props) {
     key: "",
     mode: "final",
   });
+  const [isBackfillBusy, setIsBackfillBusy] = useState(false);
+  const [backfillNotice, setBackfillNotice] = useState<string | null>(null);
+  const [backfillError, setBackfillError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -451,6 +469,17 @@ export function PipelineDashboard({ backendUrl }: Props) {
       .map((item) => ({ item, match: item.best_match }))
       .filter((entry) => !!entry.match?.link);
   }, [chosenFacePhotoRows]);
+  const closetProductUrls = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const { match } of closetProducts) {
+      const url = (match?.link ?? "").trim();
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      out.push(url);
+    }
+    return out;
+  }, [closetProducts]);
 
   const clothingStepByPhoto = useMemo(() => {
     const map = new Map<string, ClothingExtractionStep>();
@@ -541,6 +570,45 @@ export function PipelineDashboard({ backendUrl }: Props) {
     },
     [backendUrl, detail]
   );
+
+  const handleBackfillFavorites = useCallback(async () => {
+    if (closetProductUrls.length === 0) {
+      setBackfillError("No product links found in closet yet.");
+      setBackfillNotice(null);
+      return;
+    }
+    setIsBackfillBusy(true);
+    setBackfillError(null);
+    setBackfillNotice(null);
+    try {
+      const res = await fetch(`${backendUrl}/api/phia/backfill-favorites`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          product_urls: closetProductUrls,
+          collection_id: "all_favorites",
+        }),
+      });
+      const payload = (await res.json()) as BackfillFavoritesResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error((payload as { detail?: string }).detail || `Backfill HTTP ${res.status}`);
+      }
+      const data = payload as BackfillFavoritesResponse;
+      setBackfillNotice(`Added ${data.added_count}/${data.attempted_count} products to ${data.collection_id}.`);
+      if (data.failed_count > 0) {
+        const firstFailure = data.results.find((entry) => !entry.ok)?.message;
+        setBackfillError(
+          firstFailure
+            ? `Some products failed: ${firstFailure}`
+            : `Some products failed (${data.failed_count}/${data.attempted_count}).`
+        );
+      }
+    } catch (e) {
+      setBackfillError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsBackfillBusy(false);
+    }
+  }, [backendUrl, closetProductUrls]);
 
   return (
     <div className="phia-dashboard space-y-6">
@@ -986,9 +1054,21 @@ export function PipelineDashboard({ backendUrl }: Props) {
                 ) : null}
 
                 <section className="phia-subpanel p-4">
-                  <div className="mb-2 text-sm font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                    Closet
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-sm font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                      Closet
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleBackfillFavorites()}
+                      disabled={isBackfillBusy || closetProductUrls.length === 0}
+                      className="phia-soft-button rounded-xl border border-border bg-background px-3 py-1.5 text-xs font-semibold text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isBackfillBusy ? "Backfilling..." : "backfill favorites collection"}
+                    </button>
                   </div>
+                  {backfillNotice ? <div className="mb-2 text-xs text-emerald-700">{backfillNotice}</div> : null}
+                  {backfillError ? <div className="mb-2 text-xs text-destructive">{backfillError}</div> : null}
                   {closetProducts.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-border bg-background px-3 py-4 text-sm text-muted-foreground">
                       No product items found yet.

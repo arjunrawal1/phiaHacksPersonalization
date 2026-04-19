@@ -116,3 +116,25 @@ class SelectClusterRequest(BaseModel):
 
 class SelectClusterResponse(BaseModel):
     job: JobDetail
+
+
+class BackfillFavoritesRequest(BaseModel):
+    product_urls: list[str] = Field(default_factory=list)
+    collection_id: str = "all_favorites"
+
+
+class BackfillFavoritesItemResult(BaseModel):
+    product_url: str
+    ok: bool
+    message: str
+
+
+class BackfillFavoritesResponse(BaseModel):
+    phia_id: str
+    collection_id: str
+    source: str
+    requested_count: int
+    attempted_count: int
+    added_count: int
+    failed_count: int
+    results: list[BackfillFavoritesItemResult] = Field(default_factory=list)
